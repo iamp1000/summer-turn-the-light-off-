@@ -1218,17 +1218,27 @@ class SpectrumStyle(VisualStyle):
             h, s = self._cached_gradient[i]
 
             # Directed white percussion punches across physical 50 ICs
-            dist_center = abs(i - half) / half if num_zones > 1 else 0.0
             kick_val = float(getattr(state, "kick", 0.0))
             snare_val = float(getattr(state, "snare", 0.0))
             hat_val = float(getattr(state, "hat", 0.0))
-            if kick_val > 0.65 and dist_center < 0.20:
+            if is_mirrored:
+                dist_metric = abs(i - half) / half if num_zones > 1 else 0.0
+                in_bass = dist_metric < 0.20
+                in_mids = 0.25 <= dist_metric <= 0.65
+                in_highs = dist_metric > 0.70
+            else:
+                pos_ratio = i / float(max(1, num_zones - 1)) if num_zones > 1 else 0.0
+                in_bass = pos_ratio < 0.25
+                in_mids = 0.28 <= pos_ratio <= 0.70
+                in_highs = pos_ratio > 0.75
+
+            if kick_val > 0.65 and in_bass:
                 punch_w = min(1.0, (kick_val - 0.65) / 0.35)
                 s = max(20, int(s * (1.0 - punch_w * 0.70)))
-            elif snare_val > 0.55 and 0.25 <= dist_center <= 0.65:
+            elif snare_val > 0.55 and in_mids:
                 punch_s = min(1.0, (snare_val - 0.55) / 0.45)
                 s = max(20, int(s * (1.0 - punch_s * 0.65)))
-            elif hat_val > 0.50 and dist_center > 0.70:
+            elif hat_val > 0.50 and in_highs:
                 punch_h = min(1.0, (hat_val - 0.50) / 0.50)
                 s = max(20, int(s * (1.0 - punch_h * 0.70)))
 
@@ -2180,10 +2190,6 @@ class AcousticStringStyle(VisualStyle):
         # String oscillation frequency modulated by pitch/mids
         self._phase += dt * (4.0 + mid * 6.0) * self.speed
 
-        # Pluck trigger adds traveling ripple
-        if transient > 0.45:
-            self._ripples.append((num_zones / 2.0, (18.0 + transient * 25.0) * self.speed, 1.0))
-
         # ── Single-Zone L900 Mapping ──
         if num_zones == 1:
             is_pluck = transient > 0.45 or (getattr(state, "onset", 0.0) > 0.50 and transient > 0.30)
@@ -2197,12 +2203,23 @@ class AcousticStringStyle(VisualStyle):
             b = int(np.clip(amp * 100.0 * self.intensity, 0, 100))
             return [(h, s, b)]
 
-        # Update ripples
+        # Pluck trigger launches a traveling string wave from picking zone (e.g. zone 12)
+        if transient > 0.45:
+            pick_origin = (10.0 + (transient * 15.0)) % float(max(1, num_zones - 1))
+            self._ripples.append((pick_origin, (24.0 + transient * 32.0) * self.speed, 1.0))
+
+        # Update traveling ripples with physical string boundary reflection at ends
         updated_ripples = []
         for pos, vel, life in self._ripples:
             new_pos = pos + vel * dt
-            new_life = life - dt * 2.2
-            if new_life > 0.0 and new_pos < num_zones + 5:
+            new_life = life - dt * 2.0
+            if new_pos >= num_zones - 1:
+                new_pos = num_zones - 1
+                vel = -abs(vel) * 0.75  # Wave reflection off bridge!
+            elif new_pos <= 0.0:
+                new_pos = 0.0
+                vel = abs(vel) * 0.75   # Wave reflection off nut!
+            if new_life > 0.0:
                 updated_ripples.append((new_pos, vel, new_life))
         self._ripples = updated_ripples
 
@@ -2216,13 +2233,12 @@ class AcousticStringStyle(VisualStyle):
             overtone = math.sin(x * math.pi) * math.sin(self._phase * 2.0) * 0.5
             vibration = abs(fundamental + overtone * 0.6)
 
-            # Check traveling ripple from pluck
-            dist_from_center = abs(i - half)
+            # Check traveling ripple along physical string coordinate
             ripple_val = 0.0
             for r_pos, _, r_life in self._ripples:
-                d = abs(dist_from_center - (r_pos - half))
-                if d < 3.0:
-                    ripple_val = max(ripple_val, (1.0 - d / 3.0) * r_life)
+                d = abs(i - r_pos)
+                if d < 3.2:
+                    ripple_val = max(ripple_val, (1.0 - d / 3.2) * r_life)
 
             amp = (0.2 + 0.8 * self._sustain) * (0.4 + 0.6 * vibration) + ripple_val * 0.6
             v = int(np.clip((12.0 + amp * 88.0) * self.intensity, 5, 100))
