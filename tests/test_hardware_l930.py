@@ -26,11 +26,20 @@ def _find_active_tapo_hardware() -> tuple[str, str, str] | None:
     if not email or not password:
         return None
 
-    # Common candidate IPs from config and local DHCP ranges
-    candidate_ips = [
-        "10.0.0.6", "10.0.0.8", "10.0.0.24", "10.0.0.26",
-        "192.168.1.50", "192.168.1.51", "192.168.1.24", "192.168.1.26"
-    ]
+    # Check configured L930 IP from config.yaml
+    configured_l930_ip = "10.0.0.5"
+    try:
+        import yaml
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+            for d in cfg.get("tapo", {}).get("devices", {}).values():
+                if str(d.get("model", "")).upper() == "L930":
+                    configured_l930_ip = d.get("ip", configured_l930_ip)
+                    break
+    except Exception:
+        pass
+
+    candidate_ips = [configured_l930_ip]
 
     for ip in candidate_ips:
         try:

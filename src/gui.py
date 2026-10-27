@@ -1,6 +1,8 @@
 from __future__ import annotations
 import colorsys
+import json
 import math
+from pathlib import Path
 import socket
 import time
 import customtkinter as ctk
@@ -243,7 +245,51 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
-from src.window_layout import responsive_window_geometry, responsive_grid_columns
+from src.window_layout import responsive_window_geometry, responsive_grid_columns, tray_window_geometry
+
+
+STARRED_EFFECTS_PATH = Path(__file__).resolve().parent.parent / "starred_effects.json"
+
+
+def load_starred_effects() -> set[str]:
+    """Loads user's starred/loved dynamic effects from disk."""
+    try:
+        if STARRED_EFFECTS_PATH.exists():
+            with open(STARRED_EFFECTS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return set(data)
+    except Exception:
+        pass
+    return {"planar_wind", "colored_bursts", "matrix_rain", "ambient_drift"}
+
+
+def save_starred_effects(starred: set[str]):
+    """Persists user's starred/loved dynamic effects to disk."""
+    try:
+        with open(STARRED_EFFECTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(starred)), f, indent=2)
+    except Exception:
+        pass
+
+
+def make_window_stay_in_taskbar(window):
+    """Ensure the borderless window has a persistent taskbar entry and appears in Alt+Tab."""
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+        GWL_EXSTYLE = -20
+        WS_EX_APPWINDOW = 0x00040000
+        WS_EX_TOOLWINDOW = 0x00000080
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    except Exception:
+        pass
 
 
 class TapoGUI:
@@ -254,9 +300,12 @@ class TapoGUI:
     Golden Hour, and Deep Ocean.
     """
 
-    def __init__(self, hub, on_quit):
+    def __init__(self, hub, on_quit, default_mode: str = "tray"):
         self.hub = hub
         self.on_quit = on_quit
+        self.window_mode = default_mode  # "tray" (system tray app) or "normal" (popped out)
+        self._saved_normal_geometry = None
+        self._saved_tray_geometry = None
         
         self.dev_keys = list(hub.devices.keys())
         # Default to L930 device if present, ensuring all 50-zone addressable effects are visible
@@ -266,10 +315,14 @@ class TapoGUI:
         self.theme = THEMES[self.current_theme_key]
 
         self.app = ctk.CTk()
-        self.app.title("Summer — Light Control Hub")
+        self.app.title("Summer — Tray Quick Hub" if self.window_mode == "tray" else "Summer — Light Control Hub")
         self.app.resizable(True, True)
+        self.app.overrideredirect(True)
         screen_w, screen_h = self.app.winfo_screenwidth(), self.app.winfo_screenheight()
-        _, _, _, _, min_w, min_h = responsive_window_geometry(screen_w, screen_h)
+        if self.window_mode == "tray":
+            _, _, _, _, min_w, min_h = tray_window_geometry(screen_w, screen_h)
+        else:
+            _, _, _, _, min_w, min_h = responsive_window_geometry(screen_w, screen_h)
         self.app.minsize(min_w, min_h)
         # Native Windows chrome provides standard minimize, maximize and resize controls.
         # The tray icon remains active independently while this window is hidden.
@@ -294,12 +347,40 @@ class TapoGUI:
         self.card_frames = []
         self._responsive_grids = []
         self._resize_job = None
+        self._sync_job = None
+        self._last_synced_state = None
         self.active_picker = None
         self.local_ip = get_local_ip()
+        self.starred_effects = load_starred_effects()
+        self._fx_filter_mode = "all"  # "all", "starred", "1d", "2d"
 
         # Tap Sync calibration state
         self._tap_times = []
         self._tap_timer_id = None
+
+        # Clean GUI state: canvas previews and meters removed per clutter reduction
+        self.strip_canvas = None
+        self.lbl_strip_tag = None
+        self.lbl_strip_stats = None
+        self.tray_strip_canvas = None
+        self.spectrum_canvas = None
+        self.opt_eq_layout = None
+        self.audio_monitor_frame = None
+        self.bar_meter_onset = None
+        self.bar_meter_kick = None
+        self.bar_meter_snare = None
+        self.bar_meter_hat = None
+        self.lbl_meter_onset = None
+        self.lbl_meter_kick = None
+        self.lbl_meter_snare = None
+        self.lbl_meter_hat = None
+        self.lbl_mon_meta = None
+        self.lbl_lookahead_val = None
+        self.lbl_measured_delay = None
+        self.lbl_transition_val = None
+        self.gui_lookahead_slider = None
+        self.btn_click_test = None
+        self.btn_tap_sync = None
 
         # Clean window controls (Escape or header Close button hides to tray)
         self.app.bind("<Escape>", lambda e: self.hide_window())
@@ -309,6 +390,26 @@ class TapoGUI:
         self._build_ui()
         self.app.bind("<Configure>", self._on_window_configure, add="+")
         self.hub.subscribe(self._on_hub_update)
+        self._setup_global_mousewheel()
+
+    def _setup_global_mousewheel(self):
+        """Enable silky-smooth, responsive mousewheel scrolling anywhere over child widgets."""
+        def _on_mousewheel(event):
+            try:
+                canvas = None
+                if getattr(self, "window_mode", "normal") == "tray" and hasattr(self, "tray_workspace"):
+                    canvas = getattr(self.tray_workspace, "_parent_canvas", None)
+                elif hasattr(self, "content_area"):
+                    canvas = getattr(self.content_area, "_parent_canvas", None)
+
+                if canvas and canvas.winfo_exists():
+                    delta = -1 if event.delta > 0 else 1
+                    canvas.yview_scroll(delta * 2, "units")
+                    return "break"
+            except Exception:
+                pass
+
+        self.app.bind_all("<MouseWheel>", _on_mousewheel, add="+")
 
     def _enable_drag(self, widget):
         def start(event):
@@ -318,8 +419,8 @@ class TapoGUI:
             x = self.app.winfo_x() + (event.x - self._dx)
             y = self.app.winfo_y() + (event.y - self._dy)
             self.app.geometry(f"+{x}+{y}")
-        widget.bind("<Button-1>", start)
-        widget.bind("<B1-Motion>", drag)
+        widget.bind("<Button-1>", start, add="+")
+        widget.bind("<B1-Motion>", drag, add="+")
 
     def _register_responsive_grid(self, grid, max_columns: int = 3):
         """Register a grid with a maximum column count for narrow windows."""
@@ -398,11 +499,17 @@ class TapoGUI:
         """Build the redesigned desktop workspace with clear, separate pages."""
         t = self.theme
         sw, sh = self.app.winfo_screenwidth(), self.app.winfo_screenheight()
-        width, height, x, y, min_w, min_h = responsive_window_geometry(sw, sh)
+        if self.window_mode == "tray":
+            width, height, x, y, min_w, min_h = tray_window_geometry(sw, sh)
+            self._saved_tray_geometry = f"{width}x{height}+{x}+{y}"
+        else:
+            width, height, x, y, min_w, min_h = responsive_window_geometry(sw, sh)
+            self._saved_normal_geometry = f"{width}x{height}+{x}+{y}"
         self.app.minsize(min_w, min_h)
         self.app.geometry(f"{width}x{height}+{x}+{y}")
         self._has_positioned = True
         self.app.configure(fg_color=t["bg"])
+        make_window_stay_in_taskbar(self.app)
 
         self.buttons = {}
         self.tab_buttons = {}
@@ -416,56 +523,89 @@ class TapoGUI:
         self.root_frame = ctk.CTkFrame(self.app, fg_color=t["bg"], corner_radius=0)
         self.root_frame.pack(fill="both", expand=True)
 
-        # Top bar: one restrained brand block and the two global actions.
-        self.header = ctk.CTkFrame(self.root_frame, fg_color=t["bg"], corner_radius=0, height=78)
-        self.header.pack(fill="x", padx=22, pady=(14, 10))
+        # Top bar: restrained brand block with responsive actions
+        is_tray = (self.window_mode == "tray")
+        self.header = ctk.CTkFrame(self.root_frame, fg_color=t["bg"], corner_radius=0, height=70 if is_tray else 78)
+        self.header.pack(fill="x", padx=12 if is_tray else 22, pady=(10, 8) if is_tray else (14, 10))
         self.header.grid_columnconfigure(1, weight=1)
 
         logo = ctk.CTkFrame(
-            self.header, width=44, height=44, corner_radius=10,
+            self.header, width=38 if is_tray else 44, height=38 if is_tray else 44, corner_radius=10,
             fg_color=t["surface_raised"], border_width=1, border_color=t["border"]
         )
-        logo.grid(row=0, column=0, rowspan=2, padx=(0, 12), sticky="w")
+        logo.grid(row=0, column=0, rowspan=2, padx=(0, 10 if is_tray else 12), sticky="w")
         logo.grid_propagate(False)
         self.header_icon_lbl = ctk.CTkLabel(
-            logo, text="✦", font=ctk.CTkFont(size=22, weight="bold"),
+            logo, text="✦", font=ctk.CTkFont(size=18 if is_tray else 22, weight="bold"),
             text_color=t["accent_glow"]
         )
         self.header_icon_lbl.place(relx=0.5, rely=0.5, anchor="center")
 
         self.header_title = ctk.CTkLabel(
-            self.header, text="Summer  /  Light Control",
-            font=ctk.CTkFont(size=20, weight="bold"), text_color=t["text_primary"]
+            self.header,
+            text="Summer · Quick Hub" if is_tray else "Summer  /  Light Control",
+            font=ctk.CTkFont(size=15 if is_tray else 20, weight="bold"),
+            text_color=t["text_primary"],
+            anchor="w"
         )
         self.header_title.grid(row=0, column=1, sticky="w")
         status_line = ctk.CTkFrame(self.header, fg_color="transparent")
-        status_line.grid(row=1, column=1, sticky="w", pady=(2, 0))
+        status_line.grid(row=1, column=1, sticky="w", pady=(1, 0) if is_tray else (2, 0))
         self.header_status_dot = ctk.CTkLabel(
-            status_line, text="●", font=ctk.CTkFont(size=10), text_color="#35d399"
+            status_line, text="●", font=ctk.CTkFont(size=9 if is_tray else 10), text_color="#35d399"
         )
-        self.header_status_dot.pack(side="left", padx=(0, 6))
+        self.header_status_dot.pack(side="left", padx=(0, 5))
         self.header_status_lbl = ctk.CTkLabel(
             status_line, text="Local control  ·  Ready",
-            font=ctk.CTkFont(size=12), text_color=t["text_secondary"]
+            font=ctk.CTkFont(size=11 if is_tray else 12), text_color=t["text_secondary"]
         )
         self.header_status_lbl.pack(side="left")
 
         actions = ctk.CTkFrame(self.header, fg_color="transparent")
         actions.grid(row=0, column=2, rowspan=2, sticky="e")
         self.btn_top_power = ctk.CTkButton(
-            actions, text="⏻  Power", width=94, height=38, corner_radius=8,
+            actions,
+            text="⏻" if is_tray else "⏻  Power",
+            width=34 if is_tray else 88,
+            height=34 if is_tray else 36,
+            corner_radius=8,
             fg_color=t["accent_soft"], hover_color=t["accent"],
             border_width=1, border_color=t["accent"], text_color=t["text_primary"],
-            font=ctk.CTkFont(size=12, weight="bold"), command=self._handle_power_click
+            font=ctk.CTkFont(size=13 if is_tray else 12, weight="bold"),
+            command=self._handle_power_click
         )
-        self.btn_top_power.pack(side="left", padx=(0, 8))
+        self.btn_top_power.pack(side="left", padx=(0, 4 if is_tray else 6))
+        self.btn_mode_toggle = ctk.CTkButton(
+            actions,
+            text="⤢ Pop Out" if is_tray else "⤡ Mini Tray",
+            width=82 if is_tray else 94,
+            height=34 if is_tray else 36,
+            corner_radius=8,
+            fg_color=t["surface_raised"], hover_color=t["surface_high"],
+            border_width=1, border_color=t["accent"], text_color=t["accent_glow"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.toggle_window_mode
+        )
+        self.btn_mode_toggle.pack(side="left", padx=(0, 4 if is_tray else 6))
         self.btn_hide = ctk.CTkButton(
-            actions, text="Hide to tray", width=104, height=38, corner_radius=8,
+            actions, text="✕",
+            width=34 if is_tray else 36,
+            height=34 if is_tray else 36,
+            corner_radius=8,
             fg_color=t["surface_raised"], hover_color=t["surface_high"],
             border_width=1, border_color=t["border"], text_color=t["text_secondary"],
-            font=ctk.CTkFont(size=12, weight="bold"), command=self.hide_window
+            font=ctk.CTkFont(size=13, weight="bold"), command=self.hide_window
         )
         self.btn_hide.pack(side="left")
+
+        # Smooth header dragging across entire title area
+        self._enable_drag(self.header)
+        self._enable_drag(logo)
+        self._enable_drag(self.header_icon_lbl)
+        self._enable_drag(self.header_title)
+        self._enable_drag(status_line)
+        self._enable_drag(self.header_status_dot)
+        self._enable_drag(self.header_status_lbl)
 
         # Workspace is split into a stable navigation rail and a page viewport.
         self.workspace = ctk.CTkFrame(self.root_frame, fg_color="transparent")
@@ -573,6 +713,34 @@ class TapoGUI:
             btn.pack(side="left", fill="x", expand=True, padx=3)
             self.tab_buttons[dev_id] = btn
 
+        # Navigation Segment Bar (Overview, Music, Effects)
+        self.nav_tabs_bar = ctk.CTkFrame(
+            self.main_column, fg_color=t["surface"], corner_radius=8,
+            border_width=1, border_color=t["border"]
+        )
+        self.nav_tabs_bar.pack(fill="x", pady=(0, 10))
+        nav_inner = ctk.CTkFrame(self.nav_tabs_bar, fg_color="transparent")
+        nav_inner.pack(fill="x", padx=6, pady=6)
+        nav_inner.columnconfigure((0, 1, 2), weight=1)
+
+        self.nav_tab_buttons = {}
+        for idx, (page_key, glyph, label) in enumerate([
+            ("overview", "⌂", "Overview & Scenes"),
+            ("music", "♫", "Music Reactive"),
+            ("effects", "✦", "Dynamic Effects"),
+        ]):
+            is_active = (page_key == "overview")
+            btn = ctk.CTkButton(
+                nav_inner, text=f"{glyph}  {label}", height=36,
+                fg_color=t["accent"] if is_active else "transparent",
+                hover_color=t["surface_high"],
+                text_color="#ffffff" if is_active else t["text_secondary"],
+                font=ctk.CTkFont(size=12, weight="bold"), corner_radius=7,
+                command=lambda p=page_key: self._switch_page(p)
+            )
+            btn.grid(row=0, column=idx, sticky="ew", padx=3)
+            self.nav_tab_buttons[page_key] = btn
+
         scroll_kwargs = {
             "fg_color": "transparent",
             "scrollbar_button_color": t["surface_high"],
@@ -637,7 +805,7 @@ class TapoGUI:
 
         self.hero_card = make_card(overview, background=t["hero_tint"], hero=True)
         hero_top = ctk.CTkFrame(self.hero_card, fg_color="transparent")
-        hero_top.pack(fill="x", padx=20, pady=(18, 15))
+        hero_top.pack(fill="x", padx=20, pady=18)
         hero_top.grid_columnconfigure(0, weight=1)
         tag_row = ctk.CTkFrame(hero_top, fg_color="transparent")
         tag_row.grid(row=0, column=0, sticky="w", pady=(0, 7))
@@ -671,32 +839,6 @@ class TapoGUI:
             command=self._handle_power_click
         )
         self.btn_hero_power.grid(row=0, column=1, rowspan=3, sticky="e", padx=(16, 0))
-
-        strip_box = ctk.CTkFrame(
-            self.hero_card, fg_color="#10141d", corner_radius=7,
-            border_width=1, border_color=t["border"]
-        )
-        strip_box.pack(fill="x", padx=18, pady=(0, 18))
-        strip_header = ctk.CTkFrame(strip_box, fg_color="transparent")
-        strip_header.pack(fill="x", padx=12, pady=(10, 6))
-        self.lbl_strip_tag = ctk.CTkLabel(
-            strip_header, text="LIVE STRIP PREVIEW", anchor="w",
-            font=ctk.CTkFont(size=10, weight="bold"), text_color=t["text_muted"]
-        )
-        self.lbl_strip_tag.pack(side="left")
-        self.lbl_strip_stats = ctk.CTkLabel(
-            strip_header, text="ZONE 01 — 50", anchor="e",
-            font=ctk.CTkFont(size=10), text_color=t["accent_glow"]
-        )
-        self.lbl_strip_stats.pack(side="right")
-        import tkinter as tk
-        self.strip_canvas = tk.Canvas(
-            strip_box, height=38, bg="#090b10", highlightthickness=0, bd=0
-        )
-        self.strip_canvas.pack(fill="x", padx=12, pady=(0, 12))
-        self.strip_canvas.bind("<Motion>", self._on_strip_canvas_hover)
-        self.strip_canvas.bind("<Leave>", self._on_strip_canvas_leave)
-        self._last_rendered_segments = None
 
         self.bright_card = make_card(overview)
         brightness_header = ctk.CTkFrame(self.bright_card, fg_color="transparent")
@@ -849,8 +991,8 @@ class TapoGUI:
             anchor="w", font=ctk.CTkFont(size=12), text_color=t["text_muted"]
         ).pack(fill="x", pady=(3, 0))
         self.gui_section_badge = ctk.CTkLabel(
-            vstyles_header, text="WAITING", corner_radius=6,
-            fg_color=t["surface_high"], text_color=t["accent_glow"],
+            vstyles_header, text="READY", corner_radius=6,
+            fg_color=t["surface_high"], text_color=t["text_muted"],
             padx=9, pady=5, font=ctk.CTkFont(size=11, weight="bold")
         )
         self.gui_section_badge.pack(side="right", padx=(10, 0))
@@ -861,63 +1003,10 @@ class TapoGUI:
         )
         self.gui_key_pill.pack(side="right", padx=(0, 8))
         self.gui_bpm_lbl = ctk.CTkLabel(
-            vstyles_inner, text="Inactive", anchor="w",
+            vstyles_inner, text="Ready · Select a visual style or enable Audio Reactive below", anchor="w",
             font=ctk.CTkFont(size=12, weight="bold"), text_color=t["text_muted"]
         )
-        self.gui_bpm_lbl.pack(fill="x", pady=(0, 8))
-
-        self.audio_monitor_frame = ctk.CTkFrame(
-            vstyles_inner, fg_color=t["surface_raised"], corner_radius=7,
-            border_width=1, border_color=t["border"]
-        )
-        self.audio_monitor_frame.pack(fill="x", pady=(0, 14))
-        monitor_inner = ctk.CTkFrame(self.audio_monitor_frame, fg_color="transparent")
-        monitor_inner.pack(fill="x", padx=12, pady=12)
-        monitor_header = ctk.CTkFrame(monitor_inner, fg_color="transparent")
-        monitor_header.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(
-            monitor_header, text="LIVE SIGNAL", font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=t["text_muted"]
-        ).pack(side="left")
-        self.lbl_mon_meta = ctk.CTkLabel(
-            monitor_header, text="BPM: —  ·  Floor: —  ·  Tx: 0 FPS",
-            font=ctk.CTkFont(size=10), text_color=t["text_secondary"]
-        )
-        self.lbl_mon_meta.pack(side="right")
-        self.spectrum_canvas = tk.Canvas(
-            monitor_inner, height=104, bg="#0c1119", highlightthickness=0, bd=0
-        )
-        self.spectrum_canvas.pack(fill="x", pady=(0, 10))
-
-        meters_row = ctk.CTkFrame(monitor_inner, fg_color="transparent")
-        meters_row.pack(fill="x")
-        meters_row.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="meters")
-        for index, (key, label, color) in enumerate((
-            ("onset", "ONSET", "#60a5fa"),
-            ("kick", "KICK", "#a78bfa"),
-            ("snare", "SNARE", "#fb7185"),
-            ("hat", "HI-HAT", "#34d399"),
-        )):
-            cell = ctk.CTkFrame(meters_row, fg_color="transparent")
-            cell.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 10, 0))
-            top = ctk.CTkFrame(cell, fg_color="transparent")
-            top.pack(fill="x", pady=(0, 5))
-            ctk.CTkLabel(
-                top, text=label, font=ctk.CTkFont(size=10, weight="bold"),
-                text_color=t["text_muted"]
-            ).pack(side="left")
-            value_label = ctk.CTkLabel(
-                top, text="0.00", font=ctk.CTkFont(size=11, weight="bold"),
-                text_color=t["text_primary"]
-            )
-            value_label.pack(side="right")
-            meter = ctk.CTkProgressBar(
-                cell, height=8, corner_radius=4, fg_color=t["surface_high"], progress_color=color
-            )
-            meter.set(0)
-            meter.pack(fill="x")
-            setattr(self, f"lbl_meter_{key}", value_label)
-            setattr(self, f"bar_meter_{key}", meter)
+        self.gui_bpm_lbl.pack(fill="x", pady=(0, 10))
 
         self.btn_auto_mode = ctk.CTkButton(
             vstyles_inner, text="✦   Auto Director   ·   Let the music choose",
@@ -935,43 +1024,40 @@ class TapoGUI:
         for col in range(3):
             styles_grid.columnconfigure(col, weight=1, uniform="visual-styles")
         style_items = [
-            ("party", "✹  Party", "High energy"),
-            ("chill", "◌  Chill", "Slow, soft movement"),
-            ("edm", "ϟ  EDM", "Bass-led impact"),
-            ("movie", "▣  Movie", "Cinematic ambience"),
-            ("pulse", "ϟ  Pulse", "Kick ripples"),
-            ("spectrum", "▥  Spectrum", "Frequency display"),
-            ("flow", "≈  Flow", "Organic colour motion"),
-            ("bass_bounce", "↔  Bounce", "Sub-bass movement"),
-            ("center_burst", "✺  Burst", "Outward waves"),
-            ("twinkle", "✧  Twinkle", "Subtle high-end sparkle"),
+            ("pulse", "ϟ  Pulse", "Kick ripple transients"),
+            ("spectrum", "▥  Spectrum", "50-band frequency EQ"),
+            ("flow", "≈  Flow", "Harmonic color waves"),
+            ("edm", "⚡  EDM Drop", "Drop bloom & riser tension"),
+            ("chill", "◌  Chill", "Soft ambient breathing"),
+            ("party", "✹  Party", "High energy chromatic frenzy"),
+            ("neon_drive", "🚘  Neon Drive", "Synthwave 80s neon grid"),
+            ("sub_blast", "💥  Sub Blast", "Kinetic bass cannon"),
+            ("vocal_glow", "🎤  Vocal Glow", "Human voice & dialogue aura"),
+            ("liquid_groove", "💧  Liquid Groove", "Fluid viscous bass waves"),
+            ("reactive_aurora", "🌌  Aurora", "Northern lights curtain"),
+            ("twinkle", "✧  Twinkle", "Treble & hi-hat sparkle"),
+            ("bass_bounce", "↔  Bounce", "Sub-bass elastic bounce"),
+            ("center_burst", "✺  Center Burst", "Center-to-edge wave"),
+            ("segmented_vu", "📊  Segmented VU", "Staccato noise meter columns"),
+            ("bpm_resonator", "🥁  BPM Resonator", "Tempo-locked rocktaves"),
+            ("acoustic_string", "🎸  Acoustic String", "Physical string resonance"),
+            ("hydro_acoustic", "🌊  Hydro Acoustic", "Waterfall acoustic pressure"),
+            ("melodic_contour", "🎵  Melodic Contour", "Pitch-tracking melodic line"),
+            ("lofi_vinyl", "📻  Lo-Fi Vinyl", "Warm vintage flutter"),
+            ("chain_reaction", "⛓  Chain Reaction", "Stochastic lightning cascade"),
+            ("movie", "▣  Movie Sync", "Screen color + vocal aura"),
         ]
         for index, (style_id, title, description) in enumerate(style_items):
             row, col = divmod(index, 3)
             style_button = ctk.CTkButton(
                 styles_grid, text=f"{title}\n{description}", anchor="w",
                 height=62, corner_radius=7, fg_color=t["surface_high"],
-                hover_color=t["accent_soft"], border_width=1, border_color=t["border"],
+                hover_color=t["accent_soft"], border_width=0,
                 text_color=t["text_secondary"], font=ctk.CTkFont(size=12, weight="bold"),
                 command=lambda name=style_id: self._set_visual_style(name)
             )
             style_button.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
             self.vstyle_buttons[style_id] = style_button
-
-        eq_row = ctk.CTkFrame(vstyles_inner, fg_color="transparent")
-        eq_row.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(
-            eq_row, text="Spectrum layout", font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=t["text_secondary"]
-        ).pack(side="left")
-        self.opt_eq_layout = ctk.CTkSegmentedButton(
-            eq_row, values=["Mirrored 50-Band", "Segmented Staccato VU"],
-            command=self._on_eq_layout_change, height=32,
-            font=ctk.CTkFont(size=11, weight="bold"),
-            selected_color=t["accent"], selected_hover_color=t["accent_soft"]
-        )
-        self.opt_eq_layout.set("Mirrored 50-Band")
-        self.opt_eq_layout.pack(side="right")
 
         tuning_card = make_card(music)
         card_heading(tuning_card, "Response tuning", "Adjust how strongly the signal moves the lights and how bright effects can get.")
@@ -1044,56 +1130,8 @@ class TapoGUI:
         self.palette_mode_opt.set("Auto (Key/Chroma)")
         self.palette_mode_opt.pack(side="right")
 
-        latency_card = make_card(music)
-        card_heading(latency_card, "Timing & calibration", "A little lookahead can compensate for output delay.")
-        latency_inner = ctk.CTkFrame(latency_card, fg_color="transparent")
-        latency_inner.pack(fill="x", padx=18, pady=(0, 16))
-        latency_header = ctk.CTkFrame(latency_inner, fg_color="transparent")
-        latency_header.pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(
-            latency_header, text="Latency lookahead", font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=t["text_secondary"]
-        ).pack(side="left")
-        self.lbl_lookahead_val = ctk.CTkLabel(
-            latency_header, text="0 ms", font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#34d399"
-        )
-        self.lbl_lookahead_val.pack(side="left", padx=(8, 0))
-        self.lbl_transition_val = ctk.CTkLabel(
-            latency_header, text="Transition: 0 ms", font=ctk.CTkFont(size=11),
-            text_color=t["text_muted"]
-        )
-        self.lbl_transition_val.pack(side="left", padx=(12, 0))
-        self.btn_click_test = ctk.CTkButton(
-            latency_header, text="Run click test", width=120, height=32,
-            fg_color=t["surface_raised"], hover_color=t["surface_high"],
-            text_color=t["text_primary"], font=ctk.CTkFont(size=11, weight="bold"),
-            border_width=1, border_color=t["border"], corner_radius=7,
-            command=self._toggle_click_test
-        )
-        self.btn_click_test.pack(side="right")
-        self.lbl_measured_delay = ctk.CTkLabel(
-            latency_inner, text="Measured light delay: — ms",
-            font=ctk.CTkFont(size=11), text_color=t["text_muted"], anchor="w"
-        )
-        self.lbl_measured_delay.pack(fill="x", pady=(0, 8))
-        self.gui_lookahead_slider = ctk.CTkSlider(
-            latency_inner, from_=0, to=250, number_of_steps=50, height=16,
-            command=self._on_lookahead_slide, fg_color=t["surface_high"],
-            progress_color="#34d399", button_color="#6ee7b7"
-        )
-        self.gui_lookahead_slider.set(0)
-        self.gui_lookahead_slider.pack(fill="x")
-        self.btn_tap_sync = ctk.CTkButton(
-            latency_inner, text="Tap 4 beats to calibrate", height=34, corner_radius=7,
-            fg_color=t["surface_raised"], hover_color=t["surface_high"],
-            border_width=1, border_color=t["border"], text_color=t["text_secondary"],
-            font=ctk.CTkFont(size=11, weight="bold"), command=self._handle_tap_sync
-        )
-        self.btn_tap_sync.pack(anchor="e", pady=(10, 0))
-
-        accents_row = ctk.CTkFrame(latency_inner, fg_color="transparent")
-        accents_row.pack(fill="x", pady=(14, 0))
+        accents_row = ctk.CTkFrame(tuning_inner, fg_color="transparent")
+        accents_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         accent_names = [
             ("beat_flash", "Beat accents"),
             ("hat_sparkle", "Hi-hat sparkle"),
@@ -1107,7 +1145,7 @@ class TapoGUI:
             accent_button = ctk.CTkButton(
                 accents_row, text=label, height=32, corner_radius=7,
                 fg_color=t["accent_soft"], hover_color=t["surface_high"],
-                border_width=1, border_color=t["border"], text_color=t["text_primary"],
+                border_width=0, text_color=t["text_primary"],
                 font=ctk.CTkFont(size=11, weight="bold"),
                 command=lambda name=accent_id: self._toggle_accent(name)
             )
@@ -1201,7 +1239,7 @@ class TapoGUI:
         for label, value in (
             ("Control path", "Local network  ·  no per-frame cloud round trip"),
             ("Web dashboard", f"http://{self.local_ip}:{self.hub.config.get('web', {}).get('port', 8765)}"),
-            ("Configured devices", ", ".join(getattr(ctx, "name", key) for key, ctx in self.hub.devices.items()) or "None"),
+            ("Configured devices", ", ".join(str(getattr(ctx, "name", key)) for key, ctx in self.hub.devices.items()) or "None"),
         ):
             row = ctk.CTkFrame(info, fg_color="transparent")
             row.pack(fill="x", pady=5)
@@ -1230,47 +1268,278 @@ class TapoGUI:
         )
         self._bar_diag.pack(side="right", padx=10)
 
+        self._build_tray_ui()
+        if self.window_mode == "tray":
+            self.workspace.pack_forget()
+            if hasattr(self, "status_bar"):
+                self.status_bar.pack_forget()
+            self.tray_workspace.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+            self.header_title.configure(text="Summer  ·  Quick Hub")
+        else:
+            self.tray_workspace.pack_forget()
+            self.workspace.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+            if hasattr(self, "status_bar"):
+                self.status_bar.pack(fill="x", side="bottom")
+            self.header_title.configure(text="Summer  /  Light Control")
+
         self._switch_page("overview")
         self._sync_view_to_device()
         self.app.after(900, self._periodic_telemetry_tick)
-        self.app.after(120, self._periodic_strip_preview_tick)
+
+    def _build_tray_ui(self):
+        """Build the dedicated compact system-tray flyout workspace."""
+        t = self.theme
+        scroll_kwargs = {
+            "fg_color": "transparent",
+            "scrollbar_button_color": t["surface_high"],
+            "scrollbar_button_hover_color": t["accent"],
+            "corner_radius": 0,
+        }
+        self.tray_workspace = ctk.CTkScrollableFrame(self.root_frame, **scroll_kwargs)
+
+        # 1. Device Targets
+        self.tray_targets_frame = ctk.CTkFrame(
+            self.tray_workspace, fg_color=t["surface"], corner_radius=8,
+            border_width=1, border_color=t["border"]
+        )
+        self.tray_targets_frame.pack(fill="x", pady=(0, 8))
+        tray_targets_inner = ctk.CTkFrame(self.tray_targets_frame, fg_color="transparent")
+        tray_targets_inner.pack(fill="x", padx=6, pady=6)
+        
+        self.tray_tab_buttons = {}
+        for dev_id, short_label in self._device_tab_short_labels.items():
+            is_selected = (dev_id == self.current_dev_id)
+            btn = ctk.CTkButton(
+                tray_targets_inner,
+                text=short_label,
+                height=30,
+                fg_color=t["accent_soft"] if is_selected else "transparent",
+                hover_color=t["surface_high"],
+                text_color=t["text_primary"] if is_selected else t["text_secondary"],
+                border_width=1 if is_selected else 0,
+                border_color=t["accent"] if is_selected else t["border"],
+                font=ctk.CTkFont(size=11, weight="bold"),
+                corner_radius=6,
+                command=lambda d=dev_id: self._select_device_tab(d)
+            )
+            btn.pack(side="left", fill="x", expand=True, padx=2)
+            self.tray_tab_buttons[dev_id] = btn
+
+        # 2. Hero Card
+        self.tray_hero_card = ctk.CTkFrame(
+            self.tray_workspace, fg_color=t["hero_tint"], corner_radius=9,
+            border_width=1, border_color=t["hero_border"]
+        )
+        self.tray_hero_card.pack(fill="x", pady=(0, 8))
+        
+        hero_inner = ctk.CTkFrame(self.tray_hero_card, fg_color="transparent")
+        hero_inner.pack(fill="x", padx=12, pady=10)
+        hero_inner.columnconfigure(0, weight=1)
+        
+        top_row = ctk.CTkFrame(hero_inner, fg_color="transparent")
+        top_row.grid(row=0, column=0, sticky="w")
+        self.tray_hero_tag = ctk.CTkLabel(
+            top_row, text="L930", fg_color=t["surface_raised"], corner_radius=5,
+            padx=8, pady=2, font=ctk.CTkFont(size=10, weight="bold"), text_color=t["accent_glow"]
+        )
+        self.tray_hero_tag.pack(side="left", padx=(0, 6))
+        self.tray_hero_title = ctk.CTkLabel(
+            hero_inner, text="Light strip", anchor="w",
+            font=ctk.CTkFont(size=15, weight="bold"), text_color=t["text_primary"]
+        )
+        self.tray_hero_title.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        
+        st_row = ctk.CTkFrame(hero_inner, fg_color="transparent")
+        st_row.grid(row=2, column=0, sticky="w", pady=(2, 0))
+        self.tray_hero_status_dot = ctk.CTkLabel(st_row, text="●", font=ctk.CTkFont(size=9), text_color="#35d399")
+        self.tray_hero_status_dot.pack(side="left", padx=(0, 4))
+        self.tray_hero_status_lbl = ctk.CTkLabel(st_row, text="Active", font=ctk.CTkFont(size=11, weight="bold"), text_color=t["text_secondary"])
+        self.tray_hero_status_lbl.pack(side="left")
+        
+        self.tray_btn_power = ctk.CTkButton(
+            hero_inner, text="⏻", width=42, height=42, corner_radius=8,
+            fg_color=t["accent_soft"], hover_color=t["accent"], border_width=1, border_color=t["accent"],
+            font=ctk.CTkFont(size=18, weight="bold"), text_color=t["text_primary"],
+            command=self._handle_power_click
+        )
+        self.tray_btn_power.grid(row=0, column=1, rowspan=3, sticky="e")
+
+        # 3. Brightness Card
+        self.tray_bright_card = ctk.CTkFrame(
+            self.tray_workspace, fg_color=t["surface"], corner_radius=9,
+            border_width=1, border_color=t["border"]
+        )
+        self.tray_bright_card.pack(fill="x", pady=(0, 8))
+        
+        b_top = ctk.CTkFrame(self.tray_bright_card, fg_color="transparent")
+        b_top.pack(fill="x", padx=12, pady=(8, 4))
+        ctk.CTkLabel(b_top, text="Brightness", font=ctk.CTkFont(size=12, weight="bold"), text_color=t["text_primary"]).pack(side="left")
+        self.tray_bright_val_label = ctk.CTkLabel(b_top, text="50%", font=ctk.CTkFont(size=12, weight="bold"), text_color=t["accent_glow"])
+        self.tray_bright_val_label.pack(side="right")
+        
+        self.tray_bright_slider = ctk.CTkSlider(
+            self.tray_bright_card, from_=1, to=100, height=16,
+            progress_color=t["accent"], button_color=t["accent_glow"], button_hover_color=t["accent"],
+            command=self._on_brightness_slide
+        )
+        self.tray_bright_slider.pack(fill="x", padx=12, pady=(2, 6))
+        
+        chips_row = ctk.CTkFrame(self.tray_bright_card, fg_color="transparent")
+        chips_row.pack(fill="x", padx=10, pady=(0, 8))
+        chips_row.columnconfigure((0, 1, 2, 3), weight=1)
+        self.tray_quick_level_buttons = {}
+        for idx, lvl in enumerate([20, 50, 80, 100]):
+            c_btn = ctk.CTkButton(
+                chips_row, text=f"{lvl}%", height=24,
+                fg_color=t["surface_raised"], hover_color=t["surface_high"],
+                text_color=t["text_secondary"], font=ctk.CTkFont(size=10, weight="bold"),
+                corner_radius=5, command=lambda v=lvl: self._set_quick_brightness(v)
+            )
+            c_btn.grid(row=0, column=idx, padx=2, sticky="ew")
+            self.tray_quick_level_buttons[lvl] = c_btn
+
+        # 4. Interactive Modes
+        modes_frame = ctk.CTkFrame(self.tray_workspace, fg_color="transparent")
+        modes_frame.pack(fill="x", pady=(0, 8))
+        modes_frame.columnconfigure((0, 1), weight=1)
+        
+        self.tray_btn_music = ctk.CTkButton(
+            modes_frame, text="♫  Music Reactive", height=36, corner_radius=8,
+            fg_color=t["surface_raised"], hover_color=t["surface_high"],
+            border_width=1, border_color=t["border"], text_color=t["text_primary"],
+            font=ctk.CTkFont(size=11, weight="bold"), command=self._handle_music_toggle
+        )
+        self.tray_btn_music.grid(row=0, column=0, padx=(0, 3), sticky="ew")
+        
+        self.tray_btn_scr = ctk.CTkButton(
+            modes_frame, text="📺  Screen Sync", height=36, corner_radius=8,
+            fg_color=t["surface_raised"], hover_color=t["surface_high"],
+            border_width=1, border_color=t["border"], text_color=t["text_primary"],
+            font=ctk.CTkFont(size=11, weight="bold"), command=self._handle_screen_toggle
+        )
+        self.tray_btn_scr.grid(row=0, column=1, padx=(3, 0), sticky="ew")
+
+        # 5. Quick Vibes
+        self.scenes_card = ctk.CTkFrame(
+            self.tray_workspace, fg_color=t["surface"], corner_radius=9,
+            border_width=1, border_color=t["border"]
+        )
+        self.scenes_card.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(self.scenes_card, text="Quick Vibes", anchor="w", font=ctk.CTkFont(size=12, weight="bold"), text_color=t["text_primary"]).pack(fill="x", padx=12, pady=(8, 4))
+        
+        scenes_grid = ctk.CTkFrame(self.scenes_card, fg_color="transparent")
+        scenes_grid.pack(fill="x", padx=8, pady=(0, 8))
+        scenes_grid.columnconfigure((0, 1, 2), weight=1)
+        
+        self.tray_buttons = {}
+        tray_scenes = [
+            ("work", "💼 Work"),
+            ("movie", "🎬 Movie"),
+            ("synthwave", "🌆 Synth"),
+            ("fireplace", "🔥 Fire"),
+            ("sunset", "🌅 Sunset"),
+            ("cyberpunk", "⚡ Cyber"),
+        ]
+        for idx, (m_name, m_lbl) in enumerate(tray_scenes):
+            s_btn = ctk.CTkButton(
+                scenes_grid, text=m_lbl, height=30, corner_radius=6,
+                fg_color=t["surface_raised"], hover_color=t["surface_high"],
+                border_width=1, border_color=t["border"], text_color=t["text_secondary"],
+                font=ctk.CTkFont(size=10, weight="bold"), command=lambda m=m_name: self._apply_mode(m)
+            )
+            s_btn.grid(row=idx // 3, column=idx % 3, padx=2, pady=2, sticky="ew")
+            self.tray_buttons[f"mode_{m_name}"] = s_btn
+
+        # 6. Dynamic Effects (Shows Starred Favorites First)
+        self.fx_card_tray = ctk.CTkFrame(
+            self.tray_workspace, fg_color=t["surface"], corner_radius=9,
+            border_width=1, border_color=t["border"]
+        )
+        self.fx_card_tray.pack(fill="x", pady=(0, 8))
+        self.lbl_tray_fx_title = ctk.CTkLabel(self.fx_card_tray, text="Dynamic Effects", anchor="w", font=ctk.CTkFont(size=12, weight="bold"), text_color=t["text_primary"])
+        self.lbl_tray_fx_title.pack(fill="x", padx=12, pady=(8, 4))
+
+        self.fx_grid_tray = ctk.CTkFrame(self.fx_card_tray, fg_color="transparent")
+        self.fx_grid_tray.pack(fill="x", padx=8, pady=(0, 8))
+        self.fx_grid_tray.columnconfigure((0, 1), weight=1)
+        self._update_tray_dynamic_effects()
+
+        # 7. Pop Out Action Card
+        self.popout_card = ctk.CTkFrame(
+            self.tray_workspace, fg_color=t["hero_tint"], corner_radius=9,
+            border_width=1, border_color=t["hero_border"]
+        )
+        self.popout_card.pack(fill="x", pady=(0, 6))
+        
+        self.btn_big_popout = ctk.CTkButton(
+            self.popout_card, text="⤢  Pop Out to Full Window", height=38, corner_radius=8,
+            fg_color=t["accent"], hover_color=t["accent_glow"],
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#ffffff",
+            command=self.pop_out
+        )
+        self.btn_big_popout.pack(fill="x", padx=10, pady=(10, 4))
+        
+        lbl_hint = ctk.CTkLabel(
+            self.popout_card, text=f"Phone app: http://{self.local_ip}:{self.hub.config.get('web', {}).get('port', 8765)}  ·  Esc hides",
+            font=ctk.CTkFont(size=9), text_color=t["text_muted"]
+        )
+        lbl_hint.pack(padx=10, pady=(0, 8))
 
     def _switch_page(self, page_name: str):
-        """Compatibility shim: the mixer keeps all sections visible."""
+        """Display only the active section cleanly and instantaneously."""
         if page_name not in getattr(self, "page_views", {}):
             return
         self.active_page = page_name
+        for key, p_frame in self.page_views.items():
+            if key == page_name:
+                p_frame.pack(fill="x", expand=False)
+            else:
+                p_frame.pack_forget()
+
+        for key, btn in getattr(self, "nav_tab_buttons", {}).items():
+            is_act = (key == page_name)
+            btn.configure(
+                fg_color=self.theme["accent"] if is_act else "transparent",
+                text_color="#ffffff" if is_act else self.theme["text_secondary"]
+            )
         try:
-            self.page_views[page_name].update_idletasks()
-            self.content_area.update_idletasks()
-            canvas = self.content_area._parent_canvas
-            scroll_box = canvas.bbox("all")
-            total_height = max(1, (scroll_box[3] - scroll_box[1]) if scroll_box else self.content_area.winfo_height())
-            target_y = max(0, self.page_views[page_name].winfo_y())
-            canvas.yview_moveto(min(1.0, max(0.0, target_y / total_height)))
+            self.content_area._parent_canvas.yview_moveto(0.0)
         except Exception:
             pass
 
-    def _make_item_button(self, parent, label: str, dot_color: str, cmd):
+    def _make_item_button(self, parent, label: str, dot_color: str, cmd, is_starred: bool = False, on_star=None):
         t = self.theme
         frame = ctk.CTkFrame(
-            parent, fg_color=t["surface_raised"],
+            parent, fg_color=t["surface_raised"], bg_color=t["surface"],
             border_width=1, border_color=t["border"],
             corner_radius=8, cursor="hand2"
         )
         frame.bind("<Button-1>", lambda e: cmd())
 
         inner = ctk.CTkFrame(frame, fg_color="transparent")
-        inner.pack(expand=True, fill="both", padx=12, pady=10)
+        inner.pack(expand=True, fill="both", padx=10, pady=8)
         inner.bind("<Button-1>", lambda e: cmd())
 
         dot = ctk.CTkLabel(inner, text="●", font=ctk.CTkFont(size=10), text_color=dot_color)
         dot.pack(side="left", padx=(0, 6))
         dot.bind("<Button-1>", lambda e: cmd())
 
-        lbl = ctk.CTkLabel(inner, text=label, font=ctk.CTkFont(size=13, weight="bold"), text_color=t["text_primary"])
+        lbl = ctk.CTkLabel(inner, text=label, font=ctk.CTkFont(size=12, weight="bold"), text_color=t["text_primary"])
         lbl.pack(side="left")
         lbl.bind("<Button-1>", lambda e: cmd())
+
+        if on_star:
+            star_btn = ctk.CTkButton(
+                inner,
+                text="★" if is_starred else "☆",
+                width=26, height=26, corner_radius=5,
+                fg_color="transparent",
+                hover_color=t["surface_high"],
+                text_color="#fbbf24" if is_starred else t["text_muted"],
+                font=ctk.CTkFont(size=13, weight="bold"),
+                command=on_star
+            )
+            star_btn.pack(side="right", padx=(2, 0))
 
         def on_enter(e):
             frame.configure(fg_color=self.theme["surface_high"])
@@ -1284,6 +1553,57 @@ class TapoGUI:
 
         frame._active = False
         return frame
+
+    def _update_tray_dynamic_effects(self):
+        """Update the quick dynamic effects cards in the tray flyout to showcase starred effects."""
+        if not hasattr(self, "fx_grid_tray") or not self.fx_grid_tray.winfo_exists():
+            return
+        for w in self.fx_grid_tray.winfo_children():
+            w.destroy()
+        t = self.theme
+        full_st = self.hub.get_full_state()
+        catalog = full_st.get("effects_catalog", {})
+        active_names = full_st.get("effects_l930", [])
+
+        starred_names = [n for n in active_names if n in getattr(self, "starred_effects", set())]
+        if starred_names:
+            tray_items = [(n, f"★ {catalog.get(n, {}).get('display_name') or n.replace('_', ' ').title()}") for n in starred_names[:6]]
+            if hasattr(self, "lbl_tray_fx_title"):
+                self.lbl_tray_fx_title.configure(text=f"Starred Favorites ({len(starred_names)})")
+        else:
+            tray_items = [
+                ("ambient_drift", "✦ Ambient Drift"),
+                ("bioluminescent_tide", "🌊 Bio Tide"),
+                ("nebula_bloom", "🌌 Nebula Bloom"),
+                ("rainbow", "🌈 Rainbow"),
+            ]
+            if hasattr(self, "lbl_tray_fx_title"):
+                self.lbl_tray_fx_title.configure(text="Dynamic Effects")
+
+        for idx, (e_name, e_lbl) in enumerate(tray_items):
+            e_btn = ctk.CTkButton(
+                self.fx_grid_tray, text=e_lbl, height=30, corner_radius=6,
+                fg_color=t["surface_raised"], hover_color=t["surface_high"],
+                border_width=1, border_color=t["border"], text_color=t["text_secondary"],
+                font=ctk.CTkFont(size=10, weight="bold"), command=lambda e=e_name: self._apply_effect(e)
+            )
+            e_btn.grid(row=idx // 2, column=idx % 2, padx=2, pady=2, sticky="ew")
+            self.tray_buttons[f"eff_{e_name}"] = e_btn
+
+    def _set_fx_filter(self, mode: str):
+        """Switch active dynamic effects shelf filter: all, starred, 1d, 2d."""
+        self._fx_filter_mode = mode
+        self._render_effects_list()
+
+    def _toggle_star_effect(self, name: str):
+        """Toggle starred favorite status for an effect and refresh displays."""
+        if name in self.starred_effects:
+            self.starred_effects.remove(name)
+        else:
+            self.starred_effects.add(name)
+        save_starred_effects(self.starred_effects)
+        self._render_effects_list()
+        self._update_tray_dynamic_effects()
 
     def _render_effects_list(self):
         # Clean up stale effect button references before destroying widgets
@@ -1443,54 +1763,94 @@ class TapoGUI:
             # Show the full WLED-inspired audition shelf, separated by dimensional behavior.
             # "2D" is spatially projected onto the configured 50-zone strip topology.
             active_names = full_st.get("effects_l930", [])
+            starred_names = [name for name in active_names if name in getattr(self, "starred_effects", set())]
             strip_names = [name for name in active_names if catalog.get(name, {}).get("dimension") == "1D"]
             spatial_names = [name for name in active_names if catalog.get(name, {}).get("dimension") == "2D"]
-            groups = {
-                "WLED 1D · Strip Effects": strip_names,
-                "WLED 2D · Spatial Projection": spatial_names,
-            }
+
+            # Filter Mode Tabs (All, Starred Favorites, 1D Strip, 2D Spatial)
+            filter_bar = ctk.CTkFrame(self.fx_grid_frame, fg_color="transparent")
+            filter_bar.pack(fill="x", pady=(0, 10))
+            filter_opts = [
+                ("all", f"All ({len(active_names)})"),
+                ("starred", f"★ Starred ({len(starred_names)})"),
+                ("1d", f"1D Strip ({len(strip_names)})"),
+                ("2d", f"2D Spatial ({len(spatial_names)})"),
+            ]
+            for mode_key, mode_title in filter_opts:
+                is_sel = (getattr(self, "_fx_filter_mode", "all") == mode_key)
+                f_btn = ctk.CTkButton(
+                    filter_bar,
+                    text=mode_title,
+                    height=28,
+                    corner_radius=6,
+                    fg_color=t["accent"] if is_sel else t["surface_raised"],
+                    hover_color=t["surface_high"],
+                    text_color="#ffffff" if is_sel else t["text_secondary"],
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    command=lambda k=mode_key: self._set_fx_filter(k)
+                )
+                f_btn.pack(side="left", padx=(0, 6))
+
+            # Determine groups to display based on active filter mode
+            groups = {}
+            fx_mode = getattr(self, "_fx_filter_mode", "all")
+            if fx_mode == "starred":
+                if starred_names:
+                    groups["★ Starred Favorites"] = starred_names
+                else:
+                    empty_lbl = ctk.CTkLabel(
+                        self.fx_grid_frame,
+                        text="★ No starred effects yet!\nClick the star (☆) on any effect card to save your favorites here for fast access.",
+                        font=ctk.CTkFont(size=13),
+                        text_color=t["text_muted"],
+                        justify="center"
+                    )
+                    empty_lbl.pack(fill="x", pady=24)
+            elif fx_mode == "1d":
+                groups["1D Strip Effects"] = strip_names
+            elif fx_mode == "2d":
+                groups["2D Spatial Projection"] = spatial_names
+            else:  # "all"
+                if starred_names:
+                    groups["★ Starred Favorites"] = starred_names
+                groups["1D Strip Effects"] = strip_names
+                groups["2D Spatial Projection"] = spatial_names
 
             for grp_name, eff_names in groups.items():
                 if not eff_names:
                     continue
 
-                is_occasional = grp_name in ("Seasonal", "Novelty (⚠️ Rapid Flashing)")
                 grp_hdr_frame = ctk.CTkFrame(self.fx_grid_frame, fg_color="transparent")
-                grp_hdr_frame.pack(fill="x", pady=(6, 4))
+                grp_hdr_frame.pack(fill="x", pady=(8, 4))
 
-                hdr_text = f"▼  {grp_name.upper()} ({len(eff_names)})" if not is_occasional else f"▶  {grp_name.upper()} ({len(eff_names)}) (COLLAPSED)"
+                is_starred_grp = "Starred" in grp_name
+                hdr_icon = "★" if is_starred_grp else "●"
+                hdr_color = "#fbbf24" if is_starred_grp else t["accent_glow"]
+                hdr_text = f"{hdr_icon}  {grp_name.upper()} ({len(eff_names)})"
                 grp_lbl = ctk.CTkLabel(
                     grp_hdr_frame, text=hdr_text,
                     font=ctk.CTkFont(size=11, weight="bold"),
-                    text_color=t["text_muted"], anchor="w"
+                    text_color=hdr_color, anchor="w"
                 )
                 grp_lbl.pack(side="left")
 
                 grid = ctk.CTkFrame(self.fx_grid_frame, fg_color="transparent")
-                grid.pack(fill="x", pady=(0, 6))
+                grid.pack(fill="x", pady=(0, 8))
                 self._register_responsive_grid(grid)
                 grid.columnconfigure((0, 1), weight=1, uniform="fx")
                 self._effect_group_grids[grp_name] = grid
                 self._effect_group_labels[grp_name] = grp_lbl
 
-                if is_occasional:
-                    # Initially collapse occasional groups out of default shelf
-                    grid.pack_forget()
-                    def _toggle_occasional(lbl=grp_lbl, g=grid, gn=grp_name, n=len(eff_names)):
-                        if g.winfo_ismapped():
-                            g.pack_forget()
-                            lbl.configure(text=f"▶  {gn.upper()} ({n}) (COLLAPSED)")
-                        else:
-                            g.pack(fill="x", pady=(0, 6))
-                            lbl.configure(text=f"▼  {gn.upper()} ({n})")
-                    grp_hdr_frame.bind("<Button-1>", lambda e, fn=_toggle_occasional: fn())
-                    grp_lbl.bind("<Button-1>", lambda e, fn=_toggle_occasional: fn())
-
                 for idx, name in enumerate(eff_names):
                     r, c = divmod(idx, 2)
                     dot_col = EFFECT_COLORS.get(name, self.theme["accent"])
                     display = catalog.get(name, {}).get("display_name") or name.replace("_", " ").title()
-                    btn = self._make_item_button(grid, display, dot_col, lambda n=name: self._apply_effect(n))
+                    btn = self._make_item_button(
+                        grid, display, dot_col,
+                        lambda n=name: self._apply_effect(n),
+                        is_starred=(name in getattr(self, "starred_effects", set())),
+                        on_star=lambda n=name: self._toggle_star_effect(n)
+                    )
                     btn.grid(row=r, column=c, padx=3, pady=3, sticky="nsew")
                     self.buttons[f"eff_{name}"] = btn
         else:
@@ -1546,11 +1906,12 @@ class TapoGUI:
                     if not group_grid.winfo_ismapped():
                         group_grid.pack(fill="x", pady=(0, 6))
                     if group_label:
-                        group_label.configure(text=f"▼  {group_name.upper()}")
+                        hdr_ico = "★" if "Starred" in group_name else "●"
+                        group_label.configure(text=f"{hdr_ico}  {group_name.upper()}")
                 elif group_name in ("Seasonal", "Novelty (⚠️ Rapid Flashing)"):
                     group_grid.pack_forget()
                     if group_label:
-                        group_label.configure(text=f"▶  {group_name.upper()} (COLLAPSED)")
+                        group_label.configure(text=f"○  {group_name.upper()} (COLLAPSED)")
         except Exception:
             pass
 
@@ -1676,11 +2037,18 @@ class TapoGUI:
                         widget.configure(fg_color=t["surface"])
                     except Exception:
                         pass
-        for name in ("hero_card",):
+        for name in ("hero_card", "tray_hero_card", "popout_card"):
             widget = getattr(self, name, None)
             if widget:
                 try:
                     widget.configure(fg_color=t["hero_tint"], border_color=t["hero_border"])
+                except Exception:
+                    pass
+        for name in ("tray_bright_card", "scenes_card", "fx_card_tray", "tray_targets_frame"):
+            widget = getattr(self, name, None)
+            if widget:
+                try:
+                    widget.configure(fg_color=t["surface"], border_color=t["border"])
                 except Exception:
                     pass
         for name in ("btn_top_power", "btn_hero_power"):
@@ -1690,7 +2058,7 @@ class TapoGUI:
                     widget.configure(fg_color=t["accent_soft"], border_color=t["accent"])
                 except Exception:
                     pass
-        for name in ("bright_slider", "gui_sens_slider", "slider_bright_cap", "gui_lookahead_slider"):
+        for name in ("bright_slider", "tray_bright_slider", "gui_sens_slider", "slider_bright_cap", "gui_lookahead_slider"):
             widget = getattr(self, name, None)
             if widget:
                 try:
@@ -1760,6 +2128,13 @@ class TapoGUI:
             model_tag = ctx.model or "L900"
             dev_title = f"{ctx.name} ({model_tag})"
 
+        # Avoid redundant repaints when state has not changed
+        curr_sig = (self.current_dev_id, any_on, avg_b, label)
+        prev_sig = getattr(self, "_last_synced_state", None)
+        self._last_synced_state = curr_sig
+        if prev_sig is not None and prev_sig == curr_sig:
+            return
+
         # Dynamic Theme adaptation matching reference design
         target_theme = get_theme_for_label(label)
         self._apply_theme(target_theme)
@@ -1812,7 +2187,7 @@ class TapoGUI:
                 btn._active = active
                 btn.configure(
                     fg_color=self.theme["accent_soft"] if active else self.theme["surface_raised"],
-                    border_width=1 if active else 1,
+                    border_width=1 if active else 0,
                     border_color=self.theme["accent"] if active else self.theme["border"]
                 )
             except Exception:
@@ -1820,11 +2195,78 @@ class TapoGUI:
 
         self._update_effect_specific_controls(label)
 
+        # Synchronize tray flyout widgets
+        if hasattr(self, "tray_bright_slider"):
+            self.tray_bright_slider.set(avg_b)
+        if hasattr(self, "tray_bright_val_label"):
+            self.tray_bright_val_label.configure(text=f"{avg_b}%")
+        if hasattr(self, "tray_hero_tag"):
+            self.tray_hero_tag.configure(text=model_tag)
+        if hasattr(self, "tray_hero_title"):
+            self.tray_hero_title.configure(text=dev_title)
+        if hasattr(self, "tray_hero_status_lbl"):
+            st_text = label if any_on else "Idle / Off"
+            self.tray_hero_status_lbl.configure(
+                text=st_text,
+                text_color=self.theme["text_primary"] if any_on else self.theme["text_muted"]
+            )
+        if hasattr(self, "tray_hero_status_dot"):
+            self.tray_hero_status_dot.configure(
+                text_color="#10b981" if any_on else self.theme["text_muted"]
+            )
+        if hasattr(self, "tray_btn_power"):
+            self.tray_btn_power.configure(
+                fg_color=self.theme["accent_soft"] if any_on else "#3a1111",
+                border_color=self.theme["power_glow"] if any_on else "#f43f5e"
+            )
+        if hasattr(self, "tray_btn_music"):
+            self.tray_btn_music.configure(
+                fg_color=self.theme["accent_soft"] if is_music else self.theme["surface_raised"],
+                border_color=self.theme["accent"] if is_music else self.theme["border"],
+                text_color=self.theme["accent_glow"] if is_music else self.theme["text_primary"]
+            )
+        if hasattr(self, "tray_btn_scr"):
+            self.tray_btn_scr.configure(
+                fg_color="#0e3557" if is_screen else self.theme["surface_raised"],
+                border_color="#06b6d4" if is_screen else self.theme["border"],
+                text_color="#a5f3fc" if is_screen else self.theme["text_primary"]
+            )
+        for lvl, btn in getattr(self, "tray_quick_level_buttons", {}).items():
+            is_match = (abs(avg_b - lvl) < 5)
+            btn.configure(
+                fg_color=self.theme["accent_soft"] if is_match else self.theme["surface_raised"],
+                text_color=self.theme["accent_glow"] if is_match else self.theme["text_secondary"]
+            )
+        for dev_id, btn in getattr(self, "tray_tab_buttons", {}).items():
+            selected = dev_id == self.current_dev_id
+            btn.configure(
+                fg_color=self.theme["accent_soft"] if selected else "transparent",
+                text_color=self.theme["text_primary"] if selected else self.theme["text_secondary"],
+                border_width=1 if selected else 0,
+                border_color=self.theme["accent"] if selected else self.theme["border"]
+            )
+        for key, btn in getattr(self, "tray_buttons", {}).items():
+            try:
+                active = (key == f"mode_{label}" or key == f"eff_{label}")
+                btn.configure(
+                    fg_color=self.theme["accent_soft"] if active else self.theme["surface_raised"],
+                    border_color=self.theme["accent"] if active else self.theme["border"],
+                    text_color=self.theme["accent_glow"] if active else self.theme["text_secondary"]
+                )
+            except Exception:
+                pass
+
     def _on_hub_update(self, full_state: dict):
         try:
-            self.app.after(0, self._sync_view_to_device)
+            if getattr(self, "_sync_job", None) is not None:
+                return  # Coalesce: a sync tick is already queued
+            self._sync_job = self.app.after(65, self._flushed_sync_view)
         except Exception:
             pass
+
+    def _flushed_sync_view(self):
+        self._sync_job = None
+        self._sync_view_to_device()
 
     def _periodic_telemetry_tick(self):
         try:
@@ -1850,17 +2292,18 @@ class TapoGUI:
                 st_color = "#10b981" if st == "Connected" else ("#f59e0b" if st == "Reconnecting" else "#f43f5e")
                 self.gui_diag_status.configure(text=f"● {st}", text_color=st_color)
                 self._bar_diag.configure(
-                    text=f"  [Tx: {diag['send_fps']} FPS · {tot_lat}ms delay (p95: {p95_lat}ms) · {diag['drop_rate_pct']}% drop]",
-                    text_color="#10b981"
+                    text=f"LAN Sync Active  ·  {diag['send_fps']} FPS",
+                    text_color="#10b981" if st == "Connected" else st_color
                 )
-                if tot_lat > 0:
-                    self.lbl_measured_delay.configure(
-                        text=f"Measured light delay: {tot_lat} ms (Set Voicemeeter A1 delay: ~{tot_lat} ms)"
-                    )
-                else:
-                    self.lbl_measured_delay.configure(
-                        text="Measured light delay: -- ms (Set Voicemeeter A1 delay: ~-- ms)"
-                    )
+                if hasattr(self, "lbl_measured_delay") and self.lbl_measured_delay:
+                    if tot_lat > 0:
+                        self.lbl_measured_delay.configure(
+                            text=f"Measured light delay: {tot_lat} ms (Set Voicemeeter A1 delay: ~{tot_lat} ms)"
+                        )
+                    else:
+                        self.lbl_measured_delay.configure(
+                            text="Measured light delay: -- ms (Set Voicemeeter A1 delay: ~-- ms)"
+                        )
 
             # "Both strips" has no literal telemetry key; choose the active renderer,
             # preferring the L930 spectrum monitor when the shared target is selected.
@@ -1882,59 +2325,37 @@ class TapoGUI:
 
             if dev_telem and dev_telem.get("active"):
                 bpm = round(dev_telem.get("bpm", 120.0))
-                sec = str(dev_telem.get("section", "VERSE")).upper()
                 deg = round(dev_telem.get("key_hue", 215.0))
                 mode = (dev_telem.get("mode", "maj") or "maj").upper()
                 source_name = dev_telem.get("audio_source") or "loopback"
                 capture_status = dev_telem.get("capture_status", "active")
+                is_extreme = bool(dev_telem.get("is_extreme_bass") or dev_telem.get("white_strobe"))
+                is_beat = bool(is_extreme or dev_telem.get("kick", 0.0) > 0.65)
+
                 if dev_telem.get("signal_active"):
                     listening_label, listening_color = f"♫  {bpm} BPM", "#34d399"
+                    badge_label = "EXTREME BASS" if is_extreme else ("BEAT HIT" if is_beat else "SYNC ACTIVE")
+                    badge_color = "#f43f5e" if is_extreme else ("#34d399" if is_beat else self.theme["accent_glow"])
                 else:
                     listening_label, listening_color = "Listening · waiting for audio", "#fbbf24"
+                    badge_label = "LISTENING"
+                    badge_color = "#fbbf24"
                 if capture_status == "error":
                     listening_label, listening_color = "Audio capture error", "#fb7185"
+                    badge_label = "ERROR"
+                    badge_color = "#fb7185"
 
                 self.gui_bpm_lbl.configure(text=listening_label, text_color=listening_color)
-                self.gui_section_badge.configure(text=sec)
+                self.gui_section_badge.configure(text=badge_label, text_color=badge_color)
                 self.gui_key_pill.configure(text=f"🎼 {deg}° {mode}")
-
-                # Update Live Audio Monitor meters and spectrum
-                onset_val = float(dev_telem.get("onset", 0.0))
-                kick_val = float(dev_telem.get("kick", 0.0))
-                snare_val = float(dev_telem.get("snare", 0.0))
-                hat_val = float(dev_telem.get("hat", 0.0))
-                conf_pct = int(round(float(dev_telem.get("confidence", 0.0)) * 100))
-                noise_f = float(dev_telem.get("noise_floor", 0.005))
-                noise_db = int(round(20 * math.log10(max(1e-5, noise_f))))
-                send_fps = float(dev_telem.get("send_fps", (diag.get("send_fps", 0.0) if diag else 0.0)))
-
-                self.bar_meter_onset.set(max(0.0, min(1.0, onset_val)))
-                self.lbl_meter_onset.configure(text=f"{onset_val:.2f}")
-
-                self.bar_meter_kick.set(max(0.0, min(1.0, kick_val)))
-                self.lbl_meter_kick.configure(text=f"{kick_val:.2f}")
-
-                self.bar_meter_snare.set(max(0.0, min(1.0, snare_val)))
-                self.lbl_meter_snare.configure(text=f"{snare_val:.2f}")
-
-                self.bar_meter_hat.set(max(0.0, min(1.0, hat_val)))
-                self.lbl_meter_hat.configure(text=f"{hat_val:.2f}")
-
-                signal_label = "signal detected" if dev_telem.get("signal_active") else "no audio signal"
-                self.lbl_mon_meta.configure(
-                    text=f"{source_name} · {signal_label} · BPM {bpm} ({conf_pct}%) · {send_fps:.1f} FPS"
-                )
-
-                # Render mini 16-band spectrum canvas
-                raw_spec = dev_telem.get("spectrum", [])
-                self._draw_audio_spectrum(raw_spec)
 
                 # Sync active visual style button & cards
                 cur_vstyle = dev_telem.get("style", "auto")
                 self._update_style_card_selection(cur_vstyle)
-                trans = MODE_TRANSITIONS.get(cur_vstyle.lower(), 0)
-                trans_desc = "Flow" if trans > 0 else "Punchy"
-                self.lbl_transition_val.configure(text=f"Transition: {trans}ms ({trans_desc})")
+                if hasattr(self, "lbl_transition_val") and self.lbl_transition_val:
+                    trans = MODE_TRANSITIONS.get(cur_vstyle.lower(), 0)
+                    trans_desc = "Flow" if trans > 0 else "Punchy"
+                    self.lbl_transition_val.configure(text=f"Transition: {trans}ms ({trans_desc})")
             else:
                 status = (dev_telem or {}).get("capture_status", "stopped")
                 capture_error = (dev_telem or {}).get("capture_error")
@@ -1943,26 +2364,15 @@ class TapoGUI:
                 if status == "error" or capture_error:
                     message = (capture_error or "Audio capture failed").replace("\n", " ")
                     self.gui_bpm_lbl.configure(text="Capture error", text_color="#fb7185")
-                    self.lbl_mon_meta.configure(text=f"{source_name} · {message[:110]}")
                 elif status == "starting":
                     self.gui_bpm_lbl.configure(text="Starting audio…", text_color="#fbbf24")
-                    self.lbl_mon_meta.configure(text=f"Opening loopback · {source_name}")
                 elif not renderer_running:
                     self.gui_bpm_lbl.configure(text="Audio reactive is off", text_color=self.theme["text_muted"])
-                    self.lbl_mon_meta.configure(text=f"Press Audio Reactive or choose a style · {source_name}")
                 else:
                     self.gui_bpm_lbl.configure(text="Listening · waiting for audio", text_color="#fbbf24")
-                    self.lbl_mon_meta.configure(text=f"No signal received from {source_name}; try Restart audio capture.")
 
-                self.bar_meter_onset.set(0.0)
-                self.bar_meter_kick.set(0.0)
-                self.bar_meter_snare.set(0.0)
-                self.bar_meter_hat.set(0.0)
-                self.lbl_meter_onset.configure(text="0.0")
-                self.lbl_meter_kick.configure(text="0.0")
-                self.lbl_meter_snare.configure(text="0.0")
-                self.lbl_meter_hat.configure(text="0.0")
-                self._draw_audio_spectrum([])
+                self.gui_section_badge.configure(text="READY", text_color=self.theme["text_muted"])
+                self.gui_key_pill.configure(text="Key —")
         except Exception:
             pass
         finally:
@@ -1972,267 +2382,19 @@ class TapoGUI:
                 pass
 
     def _periodic_strip_preview_tick(self):
-        try:
-            if self.app.state() != "withdrawn":
-                segs = self.hub.get_zone_preview(self.current_dev_id)
-                self._draw_strip_preview(segs)
-        except Exception:
-            pass
-        finally:
-            try:
-                self.app.after(120, self._periodic_strip_preview_tick)
-            except Exception:
-                pass
+        pass
 
-    def _draw_rounded_block(self, x0: float, y0: float, x1: float, y1: float, radius: float = 2.0, **kwargs):
-        """Draws a smooth rounded rectangular LED pixel block on the canvas."""
-        r = min(radius, (x1 - x0) / 2.0, (y1 - y0) / 2.0)
-        pts = [
-            x0 + r, y0,
-            x1 - r, y0,
-            x1, y0,
-            x1, y0 + r,
-            x1, y1 - r,
-            x1, y1,
-            x1 - r, y1,
-            x0 + r, y1,
-            x0, y1,
-            x0, y1 - r,
-            x0, y0 + r,
-            x0, y0,
-        ]
-        return self.strip_canvas.create_polygon(pts, smooth=True, **kwargs)
+    def _draw_strip_preview(self, segments: Optional[List[Any]] = None):
+        pass
 
-    def _create_or_update_canvas_items(self, cw: float, ch: float):
-        """Creates or repositions canvas items once, re-using them without flicker."""
-        if getattr(self, "_canvas_geom", None) == (cw, ch) and getattr(self, "_canvas_items", None):
-            return
-        self._canvas_geom = (cw, ch)
-        self.strip_canvas.delete("all")
-        self._canvas_items = {"leds": []}
+    def _draw_audio_spectrum(self, spectrum: Optional[List[float]] = None):
+        pass
 
-        num_zones = 50
-        margin = 6.0
-        avail_w = cw - 2 * margin
-        step = avail_w / float(num_zones)
-        bw = max(2.5, step - 1.5)
-        bh = 13.0
-        cy = ch / 2.0
-        y0 = cy - bh / 2.0
-        y1 = cy + bh / 2.0
+    def _on_strip_canvas_hover(self, event=None):
+        pass
 
-        # Dark sleek recessed channel track
-        self._canvas_items["track"] = self.strip_canvas.create_rectangle(
-            margin - 2, cy - 8, cw - margin + 2, cy + 8,
-            fill="#0b0d14", outline="#171a24", width=1
-        )
-
-        for i in range(num_zones):
-            x0 = margin + i * step
-            x1 = x0 + bw
-
-            # Bloom 1 (Outer Subsurface Diffuse Glow)
-            b1 = self._draw_rounded_block(
-                x0 - 2.5, y0 - 4.5, x1 + 2.5, y1 + 4.5,
-                radius=3.5, fill="", outline="", state="hidden"
-            )
-            # Bloom 2 (Saturated Inner Neon Halo)
-            b2 = self._draw_rounded_block(
-                x0 - 1.2, y0 - 2.2, x1 + 1.2, y1 + 2.2,
-                radius=2.5, fill="", outline="", state="hidden"
-            )
-            # Core LED Block
-            blk = self._draw_rounded_block(
-                x0, y0, x1, y1, radius=2.0, fill="#131620", outline=""
-            )
-            # Specular Lens Reflection Line
-            sp = self.strip_canvas.create_line(
-                x0 + 0.8, y0 + 1.5, x1 - 0.8, y0 + 1.5,
-                fill="", width=1, state="hidden"
-            )
-
-            self._canvas_items["leds"].append({
-                "b1": b1,
-                "b2": b2,
-                "blk": blk,
-                "sp": sp
-            })
-
-    def _draw_strip_preview(self, segments: Optional[List[List[int]]] = None):
-        if not hasattr(self, "strip_canvas") or not self.strip_canvas:
-            return
-        try:
-            cw = self.strip_canvas.winfo_width()
-            ch = self.strip_canvas.winfo_height()
-            if cw <= 10:
-                cw = 320
-            if ch <= 10:
-                ch = 28
-
-            self._create_or_update_canvas_items(cw, ch)
-
-            is_powered = True
-            dev = self.hub.devices.get(self.current_dev_id)
-            if dev and not dev.state.get("power", True):
-                is_powered = False
-
-            num_zones = 50
-            led_items = self._canvas_items.get("leds", [])
-
-            # Update Canvas Header Tag with accurate preview source
-            if hasattr(self, "lbl_strip_tag") and self.lbl_strip_tag:
-                active_label = (dev.state.get("active_label", "") if dev else "") or ""
-                eff_name = active_label.lower().strip()
-                if "audio" in eff_name:
-                    self.lbl_strip_tag.configure(text="50-ZONE PREVIEW · [LIVE AUDIO STREAMED 1:1]")
-                elif "screen" in eff_name:
-                    self.lbl_strip_tag.configure(text="50-ZONE PREVIEW · [AMBILIGHT LIVE STREAM 1:1]")
-                elif eff_name in ("sunrise", "sunset", "flicker", "ocean", "raindrop", "lightning", "candy_cane", "haunted_mansion", "rainbow_native"):
-                    self.lbl_strip_tag.configure(text="50-ZONE PREVIEW · [HARDWARE APPROXIMATION]")
-                elif hasattr(dev, "fx_engine") and getattr(dev.fx_engine, "_active_kind", None) == "firmware":
-                    self.lbl_strip_tag.configure(text="50-ZONE PREVIEW · [FIRMWARE PATTERN]")
-                elif hasattr(dev, "fx_engine") and getattr(dev.fx_engine, "_active_kind", None) == "streamed_slow":
-                    self.lbl_strip_tag.configure(text="50-ZONE PREVIEW · [PROCEDURAL STREAMED 1:1]")
-                else:
-                    self.lbl_strip_tag.configure(text="50-ZONE ADDRESSABLE CANVAS")
-
-            if not is_powered or not segments or len(segments) == 0:
-                self._last_rendered_segments = None
-                for i in range(min(num_zones, len(led_items))):
-                    items = led_items[i]
-                    self.strip_canvas.itemconfig(items["b1"], state="hidden")
-                    self.strip_canvas.itemconfig(items["b2"], state="hidden")
-                    self.strip_canvas.itemconfig(items["blk"], fill="#131620", state="normal")
-                    self.strip_canvas.itemconfig(items["sp"], state="hidden")
-                return
-
-            if getattr(self, "_last_rendered_segments", None) == segments:
-                return
-            self._last_rendered_segments = [list(x) for x in segments]
-            from src.pipeline import tapo_hsv_to_rgb
-
-            for i in range(min(num_zones, len(segments), len(led_items))):
-                items = led_items[i]
-                seg = segments[i]
-                h, s, v = int(seg[0]), int(seg[1]), int(seg[2])
-                r, g, b = tapo_hsv_to_rgb(h, s, v)
-
-                r_255 = max(0, min(255, int(r * 255)))
-                g_255 = max(0, min(255, int(g * 255)))
-                b_255 = max(0, min(255, int(b * 255)))
-                core_hex = f"#{r_255:02x}{g_255:02x}{b_255:02x}"
-
-                # 1. Update Core Block
-                self.strip_canvas.itemconfig(items["blk"], fill=core_hex, state="normal")
-
-                # 2. Ambient Bloom Halos
-                if v > 8:
-                    b1_r = int(r_255 * 0.18)
-                    b1_g = int(g_255 * 0.18)
-                    b1_b = int(b_255 * 0.18)
-                    self.strip_canvas.itemconfig(
-                        items["b1"], fill=f"#{b1_r:02x}{b1_g:02x}{b1_b:02x}", state="normal"
-                    )
-
-                    b2_r = int(r_255 * 0.42)
-                    b2_g = int(g_255 * 0.42)
-                    b2_b = int(b_255 * 0.42)
-                    self.strip_canvas.itemconfig(
-                        items["b2"], fill=f"#{b2_r:02x}{b2_g:02x}{b2_b:02x}", state="normal"
-                    )
-                else:
-                    self.strip_canvas.itemconfig(items["b1"], state="hidden")
-                    self.strip_canvas.itemconfig(items["b2"], state="hidden")
-
-                # 3. Micro Specular Reflection
-                if v > 45:
-                    spec_r = min(255, r_255 + 60)
-                    spec_g = min(255, g_255 + 60)
-                    spec_b = min(255, b_255 + 60)
-                    self.strip_canvas.itemconfig(
-                        items["sp"], fill=f"#{spec_r:02x}{spec_g:02x}{spec_b:02x}", state="normal"
-                    )
-                else:
-                    self.strip_canvas.itemconfig(items["sp"], state="hidden")
-        except Exception:
-            pass
-
-    def _draw_audio_spectrum(self, spectrum: List[float]):
-        """Renders a responsive 16-bar EQ chart on self.spectrum_canvas."""
-        if not hasattr(self, "spectrum_canvas") or not self.spectrum_canvas:
-            return
-        try:
-            cw = self.spectrum_canvas.winfo_width()
-            ch = self.spectrum_canvas.winfo_height()
-            if cw <= 10:
-                cw = 320
-            if ch <= 5:
-                ch = 32
-
-            self.spectrum_canvas.delete("all")
-            num_bars = 16
-            margin = 4.0
-            gap = 2.0
-            avail_w = cw - 2 * margin - (num_bars - 1) * gap
-            bar_w = max(2.0, avail_w / float(num_bars))
-
-            # Downsample from 50 bands (or whatever length) to 16 display bars
-            bars_vals = [0.0] * num_bars
-            if spectrum and len(spectrum) > 0:
-                spec_len = len(spectrum)
-                for b_idx in range(num_bars):
-                    s_start = int(b_idx * spec_len / num_bars)
-                    s_end = max(s_start + 1, int((b_idx + 1) * spec_len / num_bars))
-                    sub = spectrum[s_start:s_end]
-                    bars_vals[b_idx] = float(max(sub)) if sub else 0.0
-
-            # Gradient colors: bass (cyan/blue) -> mid (teal/green) -> treble (amber/magenta)
-            bar_colors = [
-                "#06b6d4", "#0ea5e9", "#38bdf8", "#60a5fa",
-                "#34d399", "#10b981", "#059669", "#84cc16",
-                "#eab308", "#f59e0b", "#f97316", "#fb923c",
-                "#f43f5e", "#ec4899", "#d946ef", "#a855f7"
-            ]
-
-            for i in range(num_bars):
-                val = max(0.02, min(1.0, bars_vals[i]))
-                bar_h = max(2.0, val * (ch - 4.0))
-                x0 = margin + i * (bar_w + gap)
-                x1 = x0 + bar_w
-                y1 = ch - 2.0
-                y0 = y1 - bar_h
-
-                col = bar_colors[i % len(bar_colors)]
-                self.spectrum_canvas.create_rectangle(
-                    x0, y0, x1, y1,
-                    fill=col, outline="", width=0
-                )
-        except Exception:
-            pass
-
-    def _on_strip_canvas_hover(self, event):
-        try:
-            if not getattr(self, "_last_rendered_segments", None) or not hasattr(self, "strip_canvas"):
-                return
-            cw = self.strip_canvas.winfo_width()
-            margin = 6.0
-            avail_w = cw - 2 * margin
-            if avail_w <= 0:
-                return
-            step = avail_w / 50.0
-            idx = int((event.x - margin) / step)
-            if 0 <= idx < len(self._last_rendered_segments):
-                seg = self._last_rendered_segments[idx]
-                h, s, v = int(seg[0]), int(seg[1]), int(seg[2])
-                self.lbl_strip_stats.configure(text=f"IC #{idx} · {h}° {s}% {v}%")
-        except Exception:
-            pass
-
-    def _on_strip_canvas_leave(self, event):
-        try:
-            self.lbl_strip_stats.configure(text="IC 0 ··· IC 49")
-        except Exception:
-            pass
+    def _on_strip_canvas_leave(self, event=None):
+        pass
 
     def _on_brightness_slide(self, val):
         v = int(val)
@@ -2254,17 +2416,35 @@ class TapoGUI:
         self.hub.set_audio_device(choice)
 
     def _handle_power_click(self):
-        self.hub.set_power(self.current_dev_id)
+        try:
+            self.hub.set_power(self.current_dev_id)
+        except Exception as exc:
+            import logging
+            logging.getLogger("tapo").error(f"Error toggling power for {self.current_dev_id}: {exc}")
+            if hasattr(self, "lbl_mon_meta") and self.lbl_mon_meta:
+                self.lbl_mon_meta.configure(text=f"Power toggle error: {exc}")
 
     def _apply_mode(self, name: str):
-        self.hub.apply_mode(self.current_dev_id, name)
+        try:
+            self.hub.apply_mode(self.current_dev_id, name)
+        except Exception as exc:
+            import logging
+            logging.getLogger("tapo").error(f"Error applying mode {name} for {self.current_dev_id}: {exc}")
 
     def _apply_effect(self, name: str):
-        self.hub.apply_effect(self.current_dev_id, name)
-        self._update_effect_specific_controls(name)
+        try:
+            self.hub.apply_effect(self.current_dev_id, name)
+            self._update_effect_specific_controls(name)
+        except Exception as exc:
+            import logging
+            logging.getLogger("tapo").error(f"Error applying effect {name} for {self.current_dev_id}: {exc}")
 
     def _handle_music_toggle(self):
-        self.hub.toggle_music(self.current_dev_id)
+        try:
+            self.hub.toggle_music(self.current_dev_id)
+        except Exception as exc:
+            import logging
+            logging.getLogger("tapo").error(f"Error toggling music for {self.current_dev_id}: {exc}")
 
     def _handle_audio_retry(self):
         """Restart audio capture for the selected strip(s), showing errors instead of hiding them."""
@@ -2278,7 +2458,11 @@ class TapoGUI:
             self.gui_bpm_lbl.configure(text="Capture error", text_color="#fb7185")
 
     def _handle_screen_toggle(self):
-        self.hub.toggle_screen(self.current_dev_id)
+        try:
+            self.hub.toggle_screen(self.current_dev_id)
+        except Exception as exc:
+            import logging
+            logging.getLogger("tapo").error(f"Error toggling screen sync for {self.current_dev_id}: {exc}")
 
     def _set_visual_style(self, style_name: str):
         # Choosing a visual style is an intent to hear/react now, not just save a preset.
@@ -2295,9 +2479,10 @@ class TapoGUI:
         target_theme = get_theme_for_label(style_name)
         self._apply_theme(target_theme)
         self._update_style_card_selection(style_name)
-        trans = MODE_TRANSITIONS.get(style_name.lower(), 0)
-        trans_desc = "Flow" if trans > 0 else "Punchy"
-        self.lbl_transition_val.configure(text=f"Transition: {trans}ms ({trans_desc})")
+        if hasattr(self, "lbl_transition_val") and self.lbl_transition_val:
+            trans = MODE_TRANSITIONS.get(style_name.lower(), 0)
+            trans_desc = "Flow" if trans > 0 else "Punchy"
+            self.lbl_transition_val.configure(text=f"Transition: {trans}ms ({trans_desc})")
 
     def _on_eq_layout_change(self, choice: str):
         layout = "segmented" if "Segmented" in choice else "mirrored"
@@ -2371,11 +2556,12 @@ class TapoGUI:
 
     def _toggle_click_test(self):
         self._click_test_active = not getattr(self, "_click_test_active", False)
-        if self._click_test_active:
-            self.btn_click_test.configure(text="⏹ Stop Flash", text_color="#f43f5e")
-            self._run_click_test_pulse()
-        else:
-            self.btn_click_test.configure(text="🎯 Click-Test Flash", text_color="#10b981")
+        if self.btn_click_test:
+            if self._click_test_active:
+                self.btn_click_test.configure(text="⏹ Stop Flash", text_color="#f43f5e")
+                self._run_click_test_pulse()
+            else:
+                self.btn_click_test.configure(text="🎯 Click-Test Flash", text_color="#10b981")
 
     def _run_click_test_pulse(self):
         if not getattr(self, "_click_test_active", False):
@@ -2389,12 +2575,14 @@ class TapoGUI:
 
     def _on_audio_sensitivity_change(self, val: float):
         v = round(float(val), 1)
-        self.lbl_sens_val.configure(text=f"{v:.1f}x")
+        if self.lbl_sens_val:
+            self.lbl_sens_val.configure(text=f"{v:.1f}x")
         self.hub.set_audio_sensitivity(self.current_dev_id, v)
 
     def _on_lookahead_slide(self, val: float):
         ms = int(val)
-        self.lbl_lookahead_val.configure(text=f"{ms}ms")
+        if self.lbl_lookahead_val:
+            self.lbl_lookahead_val.configure(text=f"{ms}ms")
         self.hub.set_audio_lookahead(self.current_dev_id, ms)
 
     def _handle_tap_sync(self):
@@ -2406,7 +2594,8 @@ class TapoGUI:
 
         count = len(self._tap_times)
         if count < 4:
-            self.btn_tap_sync.configure(text=f"🎯 {count}/4", text_color=self.theme["accent_glow"])
+            if self.btn_tap_sync:
+                self.btn_tap_sync.configure(text=f"🎯 {count}/4", text_color=self.theme["accent_glow"])
             self._tap_timer_id = self.app.after(3500, self._reset_tap_sync)
         else:
             diffs = [self._tap_times[i] - self._tap_times[i - 1] for i in range(1, len(self._tap_times))]
@@ -2416,17 +2605,21 @@ class TapoGUI:
             if 0.25 <= avg_int <= 1.2:
                 calibrated = min(120, max(20, int(round((avg_int * 80.0) / 5.0) * 5)))
 
-            self.gui_lookahead_slider.set(calibrated)
-            self.lbl_lookahead_val.configure(text=f"{calibrated}ms")
+            if self.gui_lookahead_slider:
+                self.gui_lookahead_slider.set(calibrated)
+            if self.lbl_lookahead_val:
+                self.lbl_lookahead_val.configure(text=f"{calibrated}ms")
             self.hub.set_audio_lookahead(self.current_dev_id, calibrated)
 
-            self.btn_tap_sync.configure(text="✅ Done", text_color="#10b981")
+            if self.btn_tap_sync:
+                self.btn_tap_sync.configure(text="✅ Done", text_color="#10b981")
             self._tap_times = []
             self.app.after(2500, self._reset_tap_sync)
 
     def _reset_tap_sync(self):
         self._tap_times = []
-        self.btn_tap_sync.configure(text="🎯 Tap", text_color="#10b981")
+        if self.btn_tap_sync:
+            self.btn_tap_sync.configure(text="🎯 Tap", text_color="#10b981")
 
     def _show_picker(self):
         if self.active_picker:
@@ -2457,25 +2650,195 @@ class TapoGUI:
     def hide_window(self):
         """Hide the desktop window without stopping the tray-resident app."""
         try:
+            if self.app.winfo_viewable():
+                if getattr(self, "window_mode", "normal") == "tray":
+                    self._saved_tray_geometry = self.app.geometry()
+                else:
+                    self._saved_normal_geometry = self.app.geometry()
             self.app.withdraw()
         except Exception:
             pass
 
-    def show_window(self):
-        """Pop the persistent desktop window out of the tray at a screen-aware size."""
-        if not getattr(self, "_has_positioned", False):
-            sw, sh = self.app.winfo_screenwidth(), self.app.winfo_screenheight()
-            width, height, x, y, min_w, min_h = responsive_window_geometry(sw, sh)
-            self.app.minsize(min_w, min_h)
-            self.app.geometry(f"{width}x{height}+{x}+{y}")
-            self._has_positioned = True
+    def pop_out(self):
+        """Pop out of system tray into full normal desktop window with Alt+Tab and taskbar presence."""
+        try:
+            if self.app.winfo_viewable() and getattr(self, "window_mode", "normal") == "tray":
+                self._saved_tray_geometry = self.app.geometry()
+        except Exception:
+            pass
+
+        self.window_mode = "normal"
+        self.app.title("Summer — Light Control Hub")
+
+        try:
+            self.app.withdraw()
+            self.app.overrideredirect(False)
+        except Exception:
+            pass
+
+        if hasattr(self, "tray_workspace"):
+            self.tray_workspace.pack_forget()
+        if hasattr(self, "workspace"):
+            self.workspace.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        if hasattr(self, "status_bar"):
+            self.status_bar.pack(fill="x", side="bottom")
+
+        sw, sh = self.app.winfo_screenwidth(), self.app.winfo_screenheight()
+        w, h, x, y, min_w, min_h = responsive_window_geometry(sw, sh)
+        self.app.minsize(min_w, min_h)
+
+        if self._saved_normal_geometry:
+            self.app.geometry(self._saved_normal_geometry)
+        else:
+            self.app.geometry(f"{w}x{h}+{x}+{y}")
+            self._saved_normal_geometry = f"{w}x{h}+{x}+{y}"
+
+        if hasattr(self, "header"):
+            try:
+                self.header.pack_configure(padx=22)
+            except Exception:
+                pass
+        if hasattr(self, "btn_top_power"):
+            self.btn_top_power.configure(text="⏻  Power", width=88, height=36)
+        if hasattr(self, "btn_mode_toggle"):
+            self.btn_mode_toggle.configure(text="⤡ Mini Tray", width=94, height=36)
+        if hasattr(self, "btn_hide"):
+            self.btn_hide.configure(text="✕", width=36, height=36)
+        if hasattr(self, "header_title"):
+            self.header_title.configure(text="Summer  /  Light Control", font=ctk.CTkFont(size=20, weight="bold"))
+
         self.app.deiconify()
         self.app.lift()
         try:
             self.app.focus_force()
         except Exception:
             pass
+        make_window_stay_in_taskbar(self.app)
+        self._sync_view_to_device()
         self._on_window_configure()
+
+    def dock_to_tray(self):
+        """Dock from normal window into compact borderless system tray flyout mode."""
+        try:
+            if self.app.winfo_viewable() and getattr(self, "window_mode", "normal") == "normal":
+                self._saved_normal_geometry = self.app.geometry()
+        except Exception:
+            pass
+
+        self.window_mode = "tray"
+        self.app.title("Summer — Tray Quick Hub")
+
+        try:
+            self.app.withdraw()
+            self.app.overrideredirect(True)
+        except Exception:
+            pass
+
+        if hasattr(self, "workspace"):
+            self.workspace.pack_forget()
+        if hasattr(self, "status_bar"):
+            self.status_bar.pack_forget()
+        if hasattr(self, "tray_workspace"):
+            self.tray_workspace.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        sw, sh = self.app.winfo_screenwidth(), self.app.winfo_screenheight()
+        w, h, x, y, min_w, min_h = tray_window_geometry(sw, sh)
+        self.app.minsize(min_w, min_h)
+
+        if self._saved_tray_geometry:
+            self.app.geometry(self._saved_tray_geometry)
+        else:
+            self.app.geometry(f"{w}x{h}+{x}+{y}")
+            self._saved_tray_geometry = f"{w}x{h}+{x}+{y}"
+
+        if hasattr(self, "header"):
+            try:
+                self.header.pack_configure(padx=12)
+            except Exception:
+                pass
+        if hasattr(self, "btn_top_power"):
+            self.btn_top_power.configure(text="⏻", width=34, height=34)
+        if hasattr(self, "btn_mode_toggle"):
+            self.btn_mode_toggle.configure(text="⤢ Pop Out", width=82, height=34)
+        if hasattr(self, "btn_hide"):
+            self.btn_hide.configure(text="✕", width=34, height=34)
+        if hasattr(self, "header_title"):
+            self.header_title.configure(text="Summer  ·  Quick Hub", font=ctk.CTkFont(size=15, weight="bold"))
+
+        self.app.deiconify()
+        self.app.lift()
+        try:
+            self.app.focus_force()
+        except Exception:
+            pass
+        make_window_stay_in_taskbar(self.app)
+        self._sync_view_to_device()
+
+    def toggle_window_mode(self):
+        """Toggle between tray mini mode and normal popped-out window."""
+        if getattr(self, "window_mode", "normal") == "tray":
+            self.pop_out()
+        else:
+            self.dock_to_tray()
+
+    def toggle_tray_window(self):
+        """Toggle system tray mini window: hide if open in tray mode, else show in tray mode."""
+        try:
+            is_visible = self.app.winfo_viewable()
+        except Exception:
+            is_visible = False
+
+        if is_visible and getattr(self, "window_mode", "normal") == "tray":
+            self.hide_window()
+        else:
+            if getattr(self, "window_mode", "normal") != "tray":
+                self.dock_to_tray()
+            else:
+                self.show_window()
+
+    def show_window(self):
+        """Show window in its current mode (tray or normal)."""
+        if getattr(self, "window_mode", "normal") == "tray":
+            try:
+                self.app.withdraw()
+                self.app.overrideredirect(True)
+            except Exception:
+                pass
+            if not getattr(self, "_has_positioned", False):
+                sw, sh = self.app.winfo_screenwidth(), self.app.winfo_screenheight()
+                w, h, x, y, min_w, min_h = tray_window_geometry(sw, sh)
+                self.app.minsize(min_w, min_h)
+                self.app.geometry(f"{w}x{h}+{x}+{y}")
+                self._has_positioned = True
+            self.app.deiconify()
+            self.app.lift()
+            try:
+                self.app.focus_force()
+            except Exception:
+                pass
+            make_window_stay_in_taskbar(self.app)
+            self._sync_view_to_device()
+        else:
+            try:
+                self.app.withdraw()
+                self.app.overrideredirect(False)
+            except Exception:
+                pass
+            if not getattr(self, "_has_positioned", False):
+                sw, sh = self.app.winfo_screenwidth(), self.app.winfo_screenheight()
+                width, height, x, y, min_w, min_h = responsive_window_geometry(sw, sh)
+                self.app.minsize(min_w, min_h)
+                self.app.geometry(f"{width}x{height}+{x}+{y}")
+                self._has_positioned = True
+            self.app.deiconify()
+            self.app.lift()
+            try:
+                self.app.focus_force()
+            except Exception:
+                pass
+            make_window_stay_in_taskbar(self.app)
+            self._on_window_configure()
+            self._sync_view_to_device()
 
     def run(self):
         self.app.mainloop()

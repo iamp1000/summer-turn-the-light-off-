@@ -271,9 +271,11 @@ class MusicReactive:
         if isinstance(director, DirectorStyle):
             director.compositor.set_accent_enabled(name, enabled)
 
-    def set_style_params(self, speed: float | None = None, intensity: float | None = None, smoothing: float | None = None, palette_mode: str | None = None):
+    def set_style_params(self, speed: float | None = None, intensity: float | None = None, smoothing: float | None = None, palette_mode: str | None = None, brightness_cap: float | None = None):
+        if brightness_cap is not None and isinstance(self._app_state, dict):
+            self._app_state["brightness"] = max(1, min(100, int(brightness_cap)))
         for s in self._styles.values():
-            s.set_params(speed=speed, intensity=intensity, smoothing=smoothing, palette_mode=palette_mode)
+            s.set_params(speed=speed, intensity=intensity, smoothing=smoothing, palette_mode=palette_mode, brightness_cap=brightness_cap)
 
     def set_device(self, device_name: str | None):
         was_active = self._running or (
@@ -509,7 +511,7 @@ class MusicReactive:
         h, s, b = segs[0]
 
         # White punch tracking for tests
-        if st.section == Section.DROP and st.drop_strength > 0.82 and st.impact > 0.80:
+        if (st.section == Section.DROP or getattr(st, "white_strobe", False) or getattr(st, "is_extreme_bass", False)) and (st.impact > 0.70 or getattr(st, "white_strobe", False)):
             self._white_punch = 100.0
         else:
             self._white_punch = max(0.0, self._white_punch - dt * 150.0)

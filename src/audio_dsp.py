@@ -81,6 +81,10 @@ class MusicState:
     silent: bool = True         # True if stream is quiet or timed out
     source_preset: SourcePreset = SourcePreset.STANDARD
     speech_dominance: float = 0.0  # 0.0 - 1.0 speech vs music/bass ratio for dialogue suppression
+    is_extreme_bass: bool = False  # True during heavy sub-bass / kick overload
+    white_strobe: bool = False     # Beat strobe pulse for extreme bass
+    bass_ripple_phase: float = 0.0 # Rolling hue phase advanced on each bass ripple
+    sub_bass: float = 0.0          # 0.0 - 1.0 calibrated sub-bass fundamental energy (20-75 Hz, 808s)
 
     # ── Macro (30 s+) ──
     chroma: np.ndarray = field(default_factory=lambda: np.zeros(12, dtype=np.float32))
@@ -133,7 +137,7 @@ class LowPassKickDetector:
         self.y2: float = 0.0
         self.envelope: float = 0.0
 
-    def process(self, samples: np.ndarray, dt: float) -> float:
+    def process(self, samples: np.ndarray, dt: float, bpm: float = 120.0) -> float:
         n = len(samples)
         if n == 0:
             return self.envelope
@@ -158,9 +162,11 @@ class LowPassKickDetector:
         k_max = float(np.max(rect)) if n > 0 else 0.0
         target = 0.5 * k_rms + 0.5 * k_max
 
-        # Continuous attack (15ms) and decay (180ms)
-        alpha_att = 1.0 - math.exp(-dt / 0.015)
-        alpha_dec = 1.0 - math.exp(-dt / 0.180)
+        # Dynamic tempo-scaled decay: allows rock/metal double-kicks (>150 BPM) to separate cleanly
+        tempo_factor = max(60.0, min(220.0, float(bpm))) / 120.0
+        tau_decay = max(0.080, min(0.180, 0.160 / tempo_factor))
+        alpha_att = 1.0 - math.exp(-dt / 0.012)
+        alpha_dec = 1.0 - math.exp(-dt / tau_decay)
         if target > self.envelope:
             self.envelope += alpha_att * (target - self.envelope)
         else:
@@ -312,29 +318,28 @@ class CombAutocorrTempoTracker:
             self.bpm_confidence = 0.0
             return
 
-        # Autocorrelation / Comb Filter across BPM range
-        bpms = np.arange(self.min_bpm, self.max_bpm + 1.0, 1.0)
-        scores = np.zeros(len(bpms), dtype=np.float32)
-
+        # Vectorized Autocorrelation / Comb Filter across BPM range
         n = len(grid_flux)
-        for i, bpm in enumerate(bpms):
-            period_sec = 60.0 / bpm
-            lag1 = int(round(period_sec / grid_dt))
-            lag2 = lag1 * 2
+        corr_full = np.correlate(grid_flux, grid_flux, mode="full")
+        corr = corr_full[n - 1 :]
+        counts = np.arange(n, 0, -1, dtype=np.float32)
+        norm_corr = corr / np.maximum(1.0, counts)
 
-            if lag1 < n:
-                r1 = float(np.sum(grid_flux[lag1:] * grid_flux[:-lag1])) / (n - lag1)
-            else:
-                r1 = 0.0
+        bpms = np.arange(self.min_bpm, self.max_bpm + 1.0, 1.0, dtype=np.float32)
+        period_sec = 60.0 / bpms
+        lags1 = np.round(period_sec / grid_dt).astype(int)
+        lags2 = lags1 * 2
 
-            if lag2 < n:
-                r2 = float(np.sum(grid_flux[lag2:] * grid_flux[:-lag2])) / (n - lag2)
-            else:
-                r2 = 0.0
+        valid1 = (lags1 >= 0) & (lags1 < n)
+        valid2 = (lags2 >= 0) & (lags2 < n)
+        r1 = np.zeros(len(bpms), dtype=np.float32)
+        r2 = np.zeros(len(bpms), dtype=np.float32)
+        r1[valid1] = norm_corr[lags1[valid1]]
+        r2[valid2] = norm_corr[lags2[valid2]]
 
-            # Octave preference weighting (smoothes 90 - 145 BPM sweet spot)
-            octave_weight = 1.0 - 0.25 * abs(bpm - 124.0) / 60.0
-            scores[i] = (r1 + 0.5 * r2) * octave_weight
+        # Octave preference weighting (smoothes 90 - 145 BPM sweet spot)
+        octave_weight = 1.0 - 0.25 * np.abs(bpms - 124.0) / 60.0
+        scores = (r1 + 0.5 * r2) * octave_weight
 
         best_idx = int(np.argmax(scores))
         best_bpm = float(bpms[best_idx])
@@ -460,10 +465,10 @@ class DynamicSongCalibrator:
             drop_strength = 0.0
             self.norm_kick = 0.0
         else:
-            # Do not treat quiet loopback output as silence simply because
-            # the default percentile seed assumes much louder audio.
+            # Scale-invariant adaptive dynamic range: adapts cleanly even on quiet system volume
             floor = min(0.0025, self.p5)
-            dyn_range = max(0.020, self.p95 - floor)
+            observed_span = self.p95 - floor
+            dyn_range = max(0.006, observed_span)
             norm_energy = max(0.0, min(1.0, (rms - floor) / dyn_range))
             norm_energy = min(1.0, norm_energy * self.sensitivity)
 
@@ -471,8 +476,9 @@ class DynamicSongCalibrator:
             kick_vals = [h[2] for h in self.slow_history]
             top_kick = float(np.percentile(kick_vals, 95)) if len(kick_vals) >= 20 else 0.10
             kick_floor = float(np.percentile(kick_vals, 5)) if len(kick_vals) >= 20 else 0.01
-            drop_strength = max(0.0, min(1.0, kick / max(0.02, top_kick)))
-            self.norm_kick = max(0.0, min(1.0, (kick - kick_floor) / max(0.02, top_kick - kick_floor))) * self.sensitivity
+            kick_span = max(0.006, top_kick - kick_floor)
+            drop_strength = max(0.0, min(1.0, (kick - kick_floor) / max(0.015, top_kick)))
+            self.norm_kick = max(0.0, min(1.0, (kick - kick_floor) / kick_span)) * self.sensitivity
 
         # Continuous energy smoothing & trend slope
         old_energy = self.smoothed_energy
@@ -542,10 +548,19 @@ class ChromaKeyEstimator:
         self.valid_freq_indices = np.where(valid)[0]
         self.valid_freqs = freqs[valid]
         self.freqs = freqs
+        self._hann = np.hanning(fft_size).astype(np.float32)
+        mid_range = (self.freqs >= 150.0) & (self.freqs <= 900.0)
+        self._mid_indices = np.where(mid_range)[0]
 
         # MIDI semitones: 69 + 12 * log2(f / 440)
         midi_pitches = 69.0 + 12.0 * np.log2(self.valid_freqs / 440.0)
         self.pitch_classes = (np.round(midi_pitches).astype(int)) % 12
+
+        # Precompute normalized Krumhansl-Schmuckler profiles for instant matrix multiplication
+        maj_zero = self.KS_MAJOR - np.mean(self.KS_MAJOR)
+        min_zero = self.KS_MINOR - np.mean(self.KS_MINOR)
+        self._ks_maj_matrix = np.array([np.roll(maj_zero / np.linalg.norm(maj_zero), r) for r in range(12)], dtype=np.float32)
+        self._ks_min_matrix = np.array([np.roll(min_zero / np.linalg.norm(min_zero), r) for r in range(12)], dtype=np.float32)
 
     def process(self, new_samples: np.ndarray, dt: float = 0.025) -> Tuple[float, str, float, np.ndarray]:
         dt = max(0.001, dt)
@@ -559,13 +574,11 @@ class ChromaKeyEstimator:
             self.sample_buffer[-n:] = new_samples
 
         # Compute 4096-sample Hann-windowed FFT
-        window = np.hanning(self.fft_size)
-        fft_mag = np.abs(np.fft.rfft(self.sample_buffer * window))
+        fft_mag = np.abs(np.fft.rfft(self.sample_buffer * self._hann))
 
         # Global tuning estimation (A4 440 Hz reference)
         delta_tuning = 0.0
-        mid_range = (self.freqs >= 150.0) & (self.freqs <= 900.0)
-        mid_indices = np.where(mid_range)[0]
+        mid_indices = self._mid_indices
         if len(mid_indices) > 5:
             sub_mags = fft_mag[mid_indices]
             thresh = float(np.mean(sub_mags) * 2.5)
@@ -593,9 +606,11 @@ class ChromaKeyEstimator:
         pitch_classes = (np.round(effective_pitches).astype(int)) % 12
 
         # Accumulate energy into 12 semitones
-        instant_chroma = np.zeros(12, dtype=np.float32)
-        for idx, p_class in zip(self.valid_freq_indices, pitch_classes):
-            instant_chroma[p_class] += fft_mag[idx]
+        instant_chroma = np.bincount(
+            pitch_classes,
+            weights=fft_mag[self.valid_freq_indices],
+            minlength=12,
+        ).astype(np.float32)
 
         total_c = float(np.sum(instant_chroma))
         if total_c > 1e-4:
@@ -605,38 +620,31 @@ class ChromaKeyEstimator:
         alpha = 1.0 - math.exp(-dt / 14.0)
         self.chroma += alpha * (instant_chroma - self.chroma)
 
-        # Krumhansl-Schmuckler Key Correlation
-        best_r = -2.0
-        second_r = -2.0
-        best_root = 0
-        best_mode = "major"
-
+        # Krumhansl-Schmuckler Key Correlation (vectorized via matrix dot product)
         norm_chroma = self.chroma - np.mean(self.chroma)
-        std_c = float(np.std(norm_chroma))
+        norm_c_len = float(np.linalg.norm(norm_chroma))
 
-        if std_c > 1e-4:
-            for root in range(12):
-                # Major
-                rot_maj = np.roll(self.KS_MAJOR, root)
-                r_maj = float(np.corrcoef(norm_chroma, rot_maj)[0, 1])
-                if r_maj > best_r:
-                    second_r = best_r
-                    best_r = r_maj
-                    best_root = root
-                    best_mode = "major"
-                elif r_maj > second_r:
-                    second_r = r_maj
+        if norm_c_len > 1e-4:
+            x_norm = (norm_chroma / norm_c_len).astype(np.float32)
+            r_maj = self._ks_maj_matrix @ x_norm
+            r_min = self._ks_min_matrix @ x_norm
 
-                # Minor
-                rot_min = np.roll(self.KS_MINOR, root)
-                r_min = float(np.corrcoef(norm_chroma, rot_min)[0, 1])
-                if r_min > best_r:
-                    second_r = best_r
-                    best_r = r_min
-                    best_root = root
-                    best_mode = "minor"
-                elif r_min > second_r:
-                    second_r = r_min
+            best_maj_idx = int(np.argmax(r_maj))
+            best_min_idx = int(np.argmax(r_min))
+            if r_maj[best_maj_idx] >= r_min[best_min_idx]:
+                best_root = best_maj_idx
+                best_mode = "major"
+                best_r = float(r_maj[best_maj_idx])
+                r_maj_copy = r_maj.copy()
+                r_maj_copy[best_maj_idx] = -2.0
+                second_r = max(float(np.max(r_maj_copy)), float(r_min[best_min_idx]))
+            else:
+                best_root = best_min_idx
+                best_mode = "minor"
+                best_r = float(r_min[best_min_idx])
+                r_min_copy = r_min.copy()
+                r_min_copy[best_min_idx] = -2.0
+                second_r = max(float(np.max(r_min_copy)), float(r_maj[best_maj_idx]))
 
             self.key_confidence = max(0.0, min(1.0, (best_r - second_r) * 6.0))
             target_hue = float(self.FIFTHS_HUES[best_root])
@@ -652,24 +660,21 @@ class ChromaKeyEstimator:
 
         return self.current_key_hue, self.current_mode, self.key_confidence, self.chroma.copy()
 
-    def build_palette(self, centroid: float, arousal: float) -> List[Tuple[int, int, int]]:
-        """Builds a 4-colour harmonic palette in OKLCH. Pure white is NEVER present."""
-        if self.key_confidence >= 0.40:
-            base_hue = self.current_key_hue
-        else:
-            # Fallback to centroid and arousal
-            base_hue = (float(np.clip(centroid, 100, 4000) / 4000.0) * 280.0 + 40.0) % 360.0
+    def build_palette(self, centroid: float, arousal: float, ripple_phase: float = 0.0) -> List[Tuple[int, int, int]]:
+        """Builds a wide-spectrum 4-colour harmonic palette in OKLCH. Eliminates golden-warm bias."""
+        # Anchor to smoothly-decayed musical key hue; do not jump wildly on raw FFT centroid
+        base_hue = (self.current_key_hue + ripple_phase) % 360.0
 
         h1 = int(base_hue)
-        h2 = int((base_hue + 35) % 360)
+        h2 = int((base_hue + 45) % 360)
         h3 = int((base_hue + 180) % 360)
-        h4 = int((base_hue + 215) % 360)
+        h4 = int((base_hue + 225) % 360)
 
-        # OKLCH saturation/value mapping (never pure white, min sat 55%)
-        sat = int(np.clip(70 + arousal * 25, 55, 95))
-        val = int(np.clip(65 + arousal * 30, 50, 95))
+        # High saturation for vivid club-grade lighting (80-98%)
+        sat = int(np.clip(80 + arousal * 18, 75, 98))
+        val = int(np.clip(70 + arousal * 28, 55, 98))
 
-        return [(h1, sat, val), (h2, sat, val), (h3, sat - 10, val - 10), (h4, sat, val)]
+        return [(h1, sat, val), (h2, sat, val), (h3, sat - 5, val - 5), (h4, sat, val)]
 
 
 # ── 6. Structure State Machine with Dwell Times & Drop Qualification ──────────
@@ -710,17 +715,15 @@ class StructureStateMachine:
                 self._transition(Section.SILENT, now)
             return self.current_section, self.section_age, 1.0
 
-        # 2. Drop transition: high kick impact following BUILD or BREAKDOWN within 12s
-        # Strict qualification:
-        # Preceded by BUILD or BREAKDOWN within 12s, kick energy >= 2x baseline, 4s hold, 8s cooldown.
-        # VERSE cannot precede DROP directly!
+        # 2. Dynamic drop transition: responsive to real musical drops and heavy bass impacts
         time_since_drop = now - self.last_drop_time
         time_since_build = now - self.last_build_time
-        can_drop = (
+        # Support genuine drops from any section when bass impact surges
+        is_acoustic_drop = (drop_str > 0.75 and energy > 0.60 and time_since_drop >= 0.8)
+        can_drop = is_acoustic_drop or (
             (self.saw_build_or_break or time_since_build <= 12.0)
-            and drop_str > 0.85
-            and time_since_drop >= 8.0
-            and self.current_section in (Section.BUILD, Section.BREAKDOWN)
+            and drop_str > 0.80
+            and time_since_drop >= 1.0
         )
         if can_drop:
             self._transition(Section.DROP, now)
@@ -798,6 +801,12 @@ class MusicAnalyzer:
         self.blocksize = blocksize
         self.sensitivity = sensitivity
         self.latency_lookahead_ms = max(0.0, min(250.0, float(latency_lookahead_ms)))
+        self.bass_ripple_phase: float = 0.0
+        self.white_strobe_timer: float = 0.0
+        self._prev_kick: float = 0.0
+        self._prev_sub: float = 0.0
+        self._sub_peak: float = 0.50
+        self._sub_env: float = 0.0
 
         # 4096-sample rolling buffer for Hann-windowed bass & chroma resolution
         self.fft_size = 4096
@@ -811,9 +820,16 @@ class MusicAnalyzer:
         test_bands = np.interp(self.band_centers, self.freqs_4096, np.ones(len(self.freqs_4096)))
         assert len(test_bands) == 50 and np.all(test_bands > 0.0), "Filterbank bands must have positive weights"
 
-        # Frequency masks for speech and sub-bass
+        # Frequency masks for speech, sub-bass, snare, hi-hat, bass, and mid
         self.speech_mask = (self.freqs_4096 >= 250) & (self.freqs_4096 < 3400)
         self.sub_bass_mask = (self.freqs_4096 >= 20) & (self.freqs_4096 < 90)
+        self.snare_mask = (self.freqs_4096 >= 200) & (self.freqs_4096 < 2000)
+        self.hat_mask = (self.freqs_4096 >= 4000) & (self.freqs_4096 < 14000)
+        self.bass_mask = (self.freqs_4096 >= 20) & (self.freqs_4096 < 180)
+        self.mid_mask = (self.freqs_4096 >= 180) & (self.freqs_4096 < 1500)
+        self._cached_inst_n = blocksize
+        self._hann_inst = np.hanning(blocksize).astype(np.float32)
+        self._freqs_inst = np.fft.rfftfreq(blocksize, d=1.0 / samplerate)
         self.source_preset: SourcePreset = SourcePreset.STANDARD
 
         # Core Analysis Modules
@@ -838,6 +854,7 @@ class MusicAnalyzer:
         self._hat_env: float = 0.0
         self._bass_env: float = 0.0
         self._mid_env: float = 0.0
+        self._band_peaks: np.ndarray = np.full(50, 0.08, dtype=np.float32)
         self.backlog_warning_count: int = 0
 
         # Expose bpm_tracker for backwards compatibility
@@ -893,17 +910,26 @@ class MusicAnalyzer:
         bands_4096 = np.interp(self.band_centers, self.freqs_4096, fft_4096).astype(np.float32)
         pink_slope = (self.band_centers / 60.0) ** 0.30
         eq_bands = bands_4096 * pink_slope
-        norm_bands = eq_bands / max(1e-4, float(np.max(eq_bands)))
 
-        # 2. Time-Domain Low-Pass (<120 Hz) Kick Detector
-        kick_e = self.kick_detector.process(samples, dt=dt)
+        # Rolling per-band AGC: allows bass, vocals, and hi-hats to co-exist without inter-band ducking
+        self._band_peaks = np.maximum(eq_bands, self._band_peaks * math.exp(-dt / 2.6))
+        norm_bands = np.clip(eq_bands / np.maximum(0.015, self._band_peaks), 0.0, 1.0)
+
+        # 2. Time-Domain Low-Pass (<120 Hz) Kick Detector with dynamic BPM scaling
+        cur_bpm = getattr(self.tempo_tracker, "bpm", 120.0) if hasattr(self, "tempo_tracker") else 120.0
+        kick_e = self.kick_detector.process(samples, dt=dt, bpm=cur_bpm)
 
         # 3. Low-Latency Instantaneous Onset Detection
         n_inst = len(samples)
-        fft_inst = np.abs(np.fft.rfft(samples * np.hanning(n_inst)))
-        freqs_inst = np.fft.rfftfreq(n_inst, d=1.0 / self.samplerate)
+        if n_inst == getattr(self, "_cached_inst_n", -1):
+            window_inst = self._hann_inst
+            freqs_inst = self._freqs_inst
+        else:
+            window_inst = np.hanning(n_inst).astype(np.float32)
+            freqs_inst = np.fft.rfftfreq(n_inst, d=1.0 / self.samplerate)
+        fft_inst = np.abs(np.fft.rfft(samples * window_inst))
         instant_bands = np.interp(self.band_centers, freqs_inst, fft_inst).astype(np.float32)
-        norm_instant_bands = instant_bands / max(1e-4, float(np.max(instant_bands)))
+        norm_instant_bands = np.clip(instant_bands / np.maximum(0.015, self._band_peaks), 0.0, 1.0)
 
         flux, is_onset = self.onset_detector.process(norm_instant_bands, stream_time, dt=dt)
         norm_onset_raw = getattr(self.onset_detector, "normalized_onset", 0.0)
@@ -954,26 +980,26 @@ class MusicAnalyzer:
         else:
             complexity = 0.0
         complexity = float(max(0.0, min(1.0, complexity)))
-        # The spectrum renderer consumes bands directly. They were normalized to a
-        # per-frame peak but never received the sensitivity gain, so the GUI slider
-        # barely affected Spectrum and styles driven by frequency bands.
-        norm_bands = apply_sensitivity_gain(norm_bands, sens)
+        # Instantaneous band blending: 70% 512-sample low-latency FFT with 30% 4096-STFT
+        # Eliminates the 46ms STFT group delay so spectrum and band visualizers react instantly
+        fast_bands = 0.70 * norm_instant_bands + 0.30 * norm_bands
+        norm_bands = apply_sensitivity_gain(fast_bands, sens)
 
         # Transient metrics with rolling scale-invariant normalization and dedicated attack/release envelopes
-        snare_mask = (self.freqs_4096 >= 200) & (self.freqs_4096 < 2000)
-        hat_mask = (self.freqs_4096 >= 4000) & (self.freqs_4096 < 14000)
-        raw_snare = float(np.mean(fft_4096[snare_mask])) if np.any(snare_mask) else 0.0
-        raw_hat = float(np.mean(fft_4096[hat_mask])) if np.any(hat_mask) else 0.0
+        raw_snare = float(np.mean(fft_4096[self.snare_mask])) if np.any(self.snare_mask) else 0.0
+        raw_hat = float(np.mean(fft_4096[self.hat_mask])) if np.any(self.hat_mask) else 0.0
 
         if is_silent:
             self._snare_env = 0.0
             self._hat_env = 0.0
             self._bass_env = 0.0
             self._mid_env = 0.0
+            self._sub_env = 0.0
             norm_snare = 0.0
             norm_hat = 0.0
             norm_bass = 0.0
             norm_mid = 0.0
+            norm_sub = 0.0
         else:
             self._hat_peak = max(raw_hat, self._hat_peak * math.exp(-dt / 3.0))
             instant_hat = float(max(0.0, min(1.0, raw_hat / max(0.10, self._hat_peak))))
@@ -990,10 +1016,16 @@ class MusicAnalyzer:
             norm_snare = float(max(0.0, min(1.0, self._snare_env * sens)))
 
             # Absolute sub-band energy for bass (20-180 Hz) and mid (180-1500 Hz) using raw FFT magnitudes
-            bass_mask = (self.freqs_4096 >= 20) & (self.freqs_4096 < 180)
-            mid_mask = (self.freqs_4096 >= 180) & (self.freqs_4096 < 1500)
-            raw_bass_abs = float(np.mean(fft_4096[bass_mask])) if np.any(bass_mask) else 0.0
-            raw_mid_abs = float(np.mean(fft_4096[mid_mask])) if np.any(mid_mask) else 0.0
+            raw_bass_abs = float(np.mean(fft_4096[self.bass_mask])) if np.any(self.bass_mask) else 0.0
+            raw_mid_abs = float(np.mean(fft_4096[self.mid_mask])) if np.any(self.mid_mask) else 0.0
+
+            # Sub-bass fundamental (20 - 75 Hz) for deep 808s and rap/trap sub-bass glides
+            raw_sub_abs = float(np.mean(fft_4096[self.sub_bass_mask])) if np.any(self.sub_bass_mask) else 0.0
+            self._sub_peak = max(raw_sub_abs, self._sub_peak * math.exp(-dt / 3.0))
+            instant_sub = float(max(0.0, min(1.0, raw_sub_abs / max(0.12, self._sub_peak))))
+            alpha_sub = 1.0 - math.exp(-dt / 0.016) if instant_sub > self._sub_env else 1.0 - math.exp(-dt / 0.160)
+            self._sub_env += alpha_sub * (instant_sub - self._sub_env)
+            norm_sub = float(max(0.0, min(1.0, self._sub_env * sens)))
 
             self._bass_peak = max(raw_bass_abs, self._bass_peak * math.exp(-dt / 3.0))
             instant_bass = float(max(0.0, min(1.0, raw_bass_abs / max(0.20, self._bass_peak))))
@@ -1029,10 +1061,29 @@ class MusicAnalyzer:
             energy, energy_trend, drop_str, is_silent, stream_time, dt=dt
         )
 
-        # 8. Dedicated 4096-sample STFT Musical Key & OKLCH Palette
+        # Smooth gradual drift for ripple phase rather than discrete 48-degree jumps on every kick
+        self.bass_ripple_phase = (self.bass_ripple_phase + dt * 4.0) % 360.0
+        self._prev_kick = norm_kick
+        self._prev_sub = norm_sub
+
+        # Detect extreme bass & beat strobe - only during genuine drops, not ordinary beats
+        is_extreme_bass = (
+            sec == Section.DROP
+            and drop_str > 0.80
+            and (norm_bass > 0.85 or norm_kick > 0.90)
+        )
+        white_strobe = False
+        if is_extreme_bass and is_onset and norm_kick > 0.85:
+            self.white_strobe_timer = 0.060
+
+        if self.white_strobe_timer > 0.0:
+            white_strobe = True
+            self.white_strobe_timer = max(0.0, self.white_strobe_timer - dt)
+
+        # 8. Dedicated 4096-sample STFT Musical Key & Wide-Spectrum OKLCH Palette
         key_hue, mode, key_conf, chroma = self.chroma_estimator.process(samples, dt=dt)
         arousal = float(np.clip((bpm - 70.0) / 90.0 * 0.5 + energy * 0.5, 0.0, 1.0))
-        palette = self.chroma_estimator.build_palette(centroid, arousal)
+        palette = self.chroma_estimator.build_palette(centroid, arousal, ripple_phase=self.bass_ripple_phase)
 
         # 9. Timing & Backlog Alerting
         t_analysis_done = time.perf_counter()
@@ -1050,6 +1101,7 @@ class MusicAnalyzer:
             snare=norm_snare,
             hat=norm_hat,
             bass=norm_bass,
+            sub_bass=norm_sub,
             mid=norm_mid,
             transient=composite_transient,
             bpm=bpm,
@@ -1071,6 +1123,9 @@ class MusicAnalyzer:
             silent=is_silent,
             source_preset=self.source_preset,
             speech_dominance=round(speech_dominance, 3),
+            is_extreme_bass=is_extreme_bass,
+            white_strobe=white_strobe,
+            bass_ripple_phase=round(self.bass_ripple_phase, 1),
             chroma=chroma,
             key_hue=round(key_hue, 1),
             mode=mode,
@@ -1185,6 +1240,10 @@ class AudioCaptureCoordinator:
 
     def get_latest_state(self) -> Tuple[MusicState, Dict[str, float]]:
         return self._latest_slot
+
+    @property
+    def latest_state(self) -> MusicState:
+        return self._latest_slot[0]
 
     def _set_error(self, message: str):
         with self._lock:

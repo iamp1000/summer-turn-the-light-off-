@@ -299,16 +299,36 @@ class RenderPipeline:
         x = c * (1.0 - np.abs((h_norm % 2.0) - 1.0))
         m = 1.0 - c
 
-        cond0 = (h_norm < 1.0)
-        cond1 = (h_norm >= 1.0) & (h_norm < 2.0)
-        cond2 = (h_norm >= 2.0) & (h_norm < 3.0)
-        cond3 = (h_norm >= 3.0) & (h_norm < 4.0)
-        cond4 = (h_norm >= 4.0) & (h_norm < 5.0)
-        cond5 = (h_norm >= 5.0)
+        sector = np.minimum(5, h_norm.astype(np.int32))
+        s0 = (sector == 0)
+        s1 = (sector == 1)
+        s2 = (sector == 2)
+        s3 = (sector == 3)
+        s4 = (sector == 4)
+        s5 = (sector == 5)
 
-        r = np.select([cond0, cond1, cond2, cond3, cond4, cond5], [c, x, 0.0, 0.0, x, c]) + m
-        g = np.select([cond0, cond1, cond2, cond3, cond4, cond5], [x, c, c, x, 0.0, 0.0]) + m
-        b = np.select([cond0, cond1, cond2, cond3, cond4, cond5], [0.0, 0.0, x, c, c, x]) + m
+        r = np.zeros_like(c)
+        g = np.zeros_like(c)
+        b = np.zeros_like(c)
+
+        r[s0] = c[s0]
+        r[s1] = x[s1]
+        r[s4] = x[s4]
+        r[s5] = c[s5]
+
+        g[s0] = x[s0]
+        g[s1] = c[s1]
+        g[s2] = c[s2]
+        g[s3] = x[s3]
+
+        b[s2] = x[s2]
+        b[s3] = c[s3]
+        b[s4] = c[s4]
+        b[s5] = x[s5]
+
+        r += m
+        g += m
+        b += m
 
         # 1. White balance in LINEAR space
         rw = r * self.r_calib

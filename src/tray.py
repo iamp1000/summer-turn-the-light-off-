@@ -3,6 +3,7 @@ from __future__ import annotations
 import pystray
 from PIL import Image, ImageDraw
 
+
 def _make_icon_image(color=(255, 140, 0)):
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -10,8 +11,24 @@ def _make_icon_image(color=(255, 140, 0)):
     draw.ellipse((8, 8, size - 8, size - 8), fill=color)
     return img
 
+
 class TrayApp:
-    def __init__(self, mode_names, effect_names, on_mode_apply, on_effect_apply, on_toggle_power, on_music_toggle, on_screen_toggle, on_show_dashboard, on_quit, creative_effects=None, on_hide_dashboard=None):
+    def __init__(
+        self,
+        mode_names,
+        effect_names,
+        on_mode_apply,
+        on_effect_apply,
+        on_toggle_power,
+        on_music_toggle,
+        on_screen_toggle,
+        on_show_dashboard,
+        on_quit,
+        creative_effects=None,
+        on_hide_dashboard=None,
+        on_show_tray=None,
+        on_pop_out=None,
+    ):
         self._mode_names = mode_names
         self._effect_names = effect_names
         self._creative_effects = creative_effects or []
@@ -22,13 +39,15 @@ class TrayApp:
         self._on_screen_toggle = on_screen_toggle
         self._on_show_dashboard = on_show_dashboard
         self._on_hide_dashboard = on_hide_dashboard
+        self._on_show_tray = on_show_tray
+        self._on_pop_out = on_pop_out
         self._on_quit = on_quit
         self._icon = None
 
     def _build_menu(self):
         def create_mode_action(mode_name):
             return lambda icon, item: self._on_mode_apply(mode_name)
-            
+
         def create_effect_action(effect_name):
             return lambda icon, item: self._on_effect_apply(effect_name)
 
@@ -41,28 +60,33 @@ class TrayApp:
             pystray.MenuItem(name.replace("_", " ").title(), create_mode_action(name))
             for name in self._mode_names
         ]
-        
+
         effect_items = [
             pystray.MenuItem(name.replace("_", " ").title(), create_effect_action(name))
             for name in self._effect_names
         ]
 
-        menu_items = [
-            pystray.MenuItem("Pop Out / Show Window", lambda icon, item: self._on_show_dashboard(), default=True),
-        ]
+        menu_items = []
+        if callable(self._on_show_tray):
+            menu_items.append(
+                pystray.MenuItem("Quick Controls (Tray Mode)", lambda icon, item: self._on_show_tray(), default=True)
+            )
+        if callable(self._on_pop_out):
+            menu_items.append(
+                pystray.MenuItem("Pop Out (Normal Window)", lambda icon, item: self._on_pop_out(), default=not bool(self._on_show_tray))
+            )
+        elif callable(self._on_show_dashboard):
+            menu_items.append(
+                pystray.MenuItem("Pop Out / Show Window", lambda icon, item: self._on_show_dashboard(), default=True)
+            )
+
         if callable(self._on_hide_dashboard):
             menu_items.append(
                 pystray.MenuItem("Hide Window to Tray", lambda icon, item: self._on_hide_dashboard())
             )
+
         menu_items.extend([
             pystray.MenuItem("Toggle Power", lambda icon, item: self._on_toggle_power()),
-            pystray.Menu.SEPARATOR,
-        ])
-        if creative_items:
-            menu_items.append(pystray.MenuItem("Creative Experiences (L930)", pystray.Menu(*creative_items)))
-        menu_items.extend([
-            pystray.MenuItem("Organic Effects", pystray.Menu(*effect_items)),
-            pystray.MenuItem("Static Vibes", pystray.Menu(*mode_items)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Music Reactive", lambda icon, item: self._on_music_toggle()),
             pystray.MenuItem("Screen Sync", lambda icon, item: self._on_screen_toggle()),

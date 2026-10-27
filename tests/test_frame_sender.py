@@ -135,7 +135,7 @@ async def test_frame_sender_aimd_one_ups_fallback_pacing():
 
     async def slow_mock_transmit(frame):
         transmit_timestamps.append(time.perf_counter())
-        await asyncio.sleep(0.420)  # > 400ms triggers AIMD drop to 1 update/s
+        await asyncio.sleep(0.900)  # > 850ms triggers AIMD drop to 1 update/s
         return True
 
     loop = asyncio.get_running_loop()
@@ -154,7 +154,7 @@ async def test_frame_sender_aimd_one_ups_fallback_pacing():
     sender.submit_frame({"id": "pending_rapid"})
 
     # Wait long enough for frame 1 to finish (420ms) and frame 2 to wait for 1.0s interval
-    await asyncio.sleep(1.550)
+    await asyncio.sleep(2.100)
     sender.stop()
 
     assert len(transmit_timestamps) == 2

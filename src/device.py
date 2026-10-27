@@ -38,7 +38,10 @@ def is_session_timeout(e: Exception) -> bool:
 def safe_notify(title: str, message: str):
     """Safely dispatches desktop toast notification without crashing headless threads."""
     import sys
-    if "pytest" in sys.modules:
+    log.info(f"[{title}] {message}")
+    if "pytest" in sys.modules or sys.platform == "win32":
+        # On Windows, plyer spawns unmanaged balloon_tip threads that raise
+        # unhandled 'Shell_NotifyIconW failed' exceptions alongside pystray.
         return
     try:
         notification.notify(
@@ -372,11 +375,13 @@ class LightController:
         async with self._lock:
             try:
                 await self._ensure_connected()
-                await self._device.turn_on()
+                if self._device is not None:
+                    await self._device.turn_on()
                 self._is_on = True
                 self._last_successful_response = time.time()
                 self.diagnostics.set_status("connected")
             except Exception as e:
+                self._is_on = False
                 asyncio.create_task(self._handle_failure(e))
 
     async def turn_off(self, priority: int = 0):
@@ -385,7 +390,8 @@ class LightController:
         async with self._lock:
             try:
                 await self._ensure_connected()
-                await self._device.turn_off()
+                if self._device is not None:
+                    await self._device.turn_off()
                 self._last_successful_response = time.time()
                 self.diagnostics.set_status("off")
             except Exception as e:

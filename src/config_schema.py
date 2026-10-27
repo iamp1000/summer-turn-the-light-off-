@@ -10,7 +10,7 @@ class DeviceCalibrationConfig(BaseModel):
     white_balance: List[float] = Field(default_factory=lambda: [1.0, 1.0, 1.0])
     min_brightness: int = Field(default=0, ge=0, le=100)
     transition_ms: int = Field(default=0, ge=0, le=6000)
-    music_transition_ms: Optional[int] = Field(default=120, ge=0, le=6000)
+    music_transition_ms: Optional[int] = Field(default=0, ge=0, le=6000)
     movie_transition_ms: Optional[int] = Field(default=800, ge=0, le=6000)
     max_updates_per_s: Optional[float] = Field(default=5.0, ge=0.5, le=30.0)
     movie_max_updates_per_s: Optional[float] = Field(default=2.0, ge=0.5, le=30.0)
@@ -93,6 +93,11 @@ class ScreenSyncConfig(BaseModel):
     profile: Optional[str] = "balanced"
 
 
+class GUIConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+    default_mode: Optional[str] = "tray"  # "tray" or "normal"
+
+
 class AppConfig(BaseModel):
     model_config = {"extra": "forbid"}
     tapo: TapoConfig
@@ -103,6 +108,7 @@ class AppConfig(BaseModel):
     audio: Optional[AudioConfig] = None
     screen_sync: Optional[ScreenSyncConfig] = None
     calibration: Optional[Dict[str, DeviceCalibrationConfig]] = None
+    gui: Optional[GUIConfig] = Field(default_factory=GUIConfig)
 
 
 def validate_config(raw_config: dict) -> AppConfig:

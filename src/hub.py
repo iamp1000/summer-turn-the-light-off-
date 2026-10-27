@@ -66,7 +66,7 @@ class DeviceContext:
         if audio_coordinator and hasattr(self.audio_sync, "set_coordinator"):
             self.audio_sync.set_coordinator(audio_coordinator)
 
-        self.screen_sync = ScreenSync(controller, loop_runner, self.state, frame_bus=frame_bus, dev_id=dev_id)
+        self.screen_sync = ScreenSync(controller, loop_runner, self.state, frame_bus=frame_bus, dev_id=dev_id, audio_coordinator=audio_coordinator)
         if hasattr(self.audio_sync, "_screen_sync"):
             self.audio_sync._screen_sync = self.screen_sync
         self.effects_cfg = effects_cfg
@@ -447,14 +447,24 @@ class LightHub:
                     on_relinquish=ctx.stop_all_active, renew=True,
                 )
                 ctx.state["active_label"] = "Off"
-                self.loop_runner.run(ctx.controller.turn_off(priority=0))
+                fut = self.loop_runner.run(ctx.controller.turn_off(priority=0))
             else:
                 self.arbiter.claim_output(
                     ctx.dev_id, OutputProducer.STATIC,
                     on_relinquish=ctx.stop_all_active, renew=True,
                 )
                 ctx.state["active_label"] = "Idle"
-                self.loop_runner.run(ctx.controller.turn_on(priority=0))
+                fut = self.loop_runner.run(ctx.controller.turn_on(priority=0))
+
+            def _on_power_done(f, c=ctx):
+                try:
+                    f.result()
+                    c.state["power"] = getattr(c.controller, "_is_on", c.state["power"])
+                except Exception as exc:
+                    c.state["last_error"] = str(exc)
+                self.notify_change()
+
+            fut.add_done_callback(_on_power_done)
         self.notify_change()
 
     def set_brightness(self, dev_id: str, val: int):
@@ -470,11 +480,17 @@ class LightHub:
             if hasattr(ctx, "fx_engine") and hasattr(ctx.fx_engine, "set_parameters"):
                 ctx.fx_engine.set_parameters(brightness=val)
 
+            if hasattr(ctx, "audio_sync") and hasattr(ctx.audio_sync, "set_style_params"):
+                ctx.audio_sync.set_style_params(brightness_cap=float(val))
+
             # In the live application every device is bound to FrameBus. Dynamic
             # producers consume the updated app state/engine parameter and publish
             # their next frame; they must not be overridden by a direct brightness API.
             if getattr(self, "frame_bus", None) and getattr(self, "arbiter", None):
                 owner = self.arbiter.get_owner(ctx.dev_id)
+                if owner == OutputProducer.IDLE and ctx.state.get("power", True):
+                    self.arbiter.claim_output(ctx.dev_id, OutputProducer.STATIC, renew=True)
+                    owner = OutputProducer.STATIC
                 if owner != OutputProducer.STATIC:
                     continue
 
@@ -486,16 +502,15 @@ class LightHub:
 
                 if ctx.model == "L930":
                     segments = current.segments if current and current.segments else getattr(ctx.controller, "last_segments", None)
-                    if not segments:
-                        continue
-                    pre_corrected = current.pre_corrected if current else False
-                    copied_segments = [list(zone) for zone in segments]
-                    if pre_corrected:
-                        # The L930 payload serializer deliberately skips its master
-                        # multiplier for pre-corrected frames. Scale the zone values
-                        # here, relative to the *previous* master level, so dimmer
-                        # changes actually change the pixels without a second gamma pass.
-                        scale = val / float(previous_brightness)
+                    if not segments or all(len(z) >= 3 and z[2] == 0 for z in segments):
+                        h = getattr(ctx.controller, "last_h", 30)
+                        s = getattr(ctx.controller, "last_s", 30)
+                        copied_segments = [[h, s, val]] * 50
+                        pre_corrected = False
+                    else:
+                        pre_corrected = current.pre_corrected if current else False
+                        copied_segments = [list(zone) for zone in segments]
+                        scale = val / float(previous_brightness) if previous_brightness > 0 else 1.0
                         for zone in copied_segments:
                             if len(zone) >= 3:
                                 zone[2] = max(0, min(100, int(round(int(zone[2]) * scale))))
@@ -740,11 +755,11 @@ class LightHub:
                 ctx.audio_sync.set_accent(name, enabled)
         self.notify_change()
 
-    def set_style_params(self, dev_id: str, speed: float | None = None, intensity: float | None = None, smoothing: float | None = None, palette_mode: str | None = None):
+    def set_style_params(self, dev_id: str, speed: float | None = None, intensity: float | None = None, smoothing: float | None = None, palette_mode: str | None = None, brightness_cap: float | None = None):
         targets = self._resolve_targets(dev_id)
         for ctx in targets:
             if hasattr(ctx.audio_sync, "set_style_params"):
-                ctx.audio_sync.set_style_params(speed=speed, intensity=intensity, smoothing=smoothing, palette_mode=palette_mode)
+                ctx.audio_sync.set_style_params(speed=speed, intensity=intensity, smoothing=smoothing, palette_mode=palette_mode, brightness_cap=brightness_cap)
         self.notify_change()
 
     def toggle_screen(self, dev_id: str):

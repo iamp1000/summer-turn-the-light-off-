@@ -23,7 +23,8 @@ class LatestFrameSender:
         diagnostics: DeviceDiagnostics,
         loop: asyncio.AbstractEventLoop,
         max_updates_per_s: float = 5.0,
-        min_zone_delta: int = 3,
+        min_zone_delta: int = 1,
+        aimd_threshold_s: float = 0.850,
     ):
         self.dev_id = dev_id
         self._transmit_fn = transmit_fn
@@ -32,6 +33,7 @@ class LatestFrameSender:
 
         self.max_updates_per_s = float(max_updates_per_s)
         self.min_zone_delta = int(min_zone_delta)
+        self.aimd_threshold_s = float(aimd_threshold_s)
 
         self._lock = threading.Lock()
         self._pending_frame: Any | None = None
@@ -261,18 +263,18 @@ class LatestFrameSender:
                     self._last_sent_hsb = (frame[0], frame[1], frame[2])
 
             # ── Phase R: AIMD Rate Control ──
-            if not success or dt > 0.400:
-                # Drop to 1 update/s for 30 s on slow response or failure
+            if not success or dt > self.aimd_threshold_s:
+                # Drop to 1 update/s briefly on slow response or failure with fast 2.5s recovery
                 self._aimd_rate_cap = 1.0
-                self._aimd_drop_until = now + 30.0
+                self._aimd_drop_until = now + 2.5
                 log.warning(
                     f"[{self.dev_id}] AIMD triggered (rtt={dt*1000:.0f}ms, success={success}). "
-                    f"Dropped to 1 update/s for 30s."
+                    f"Dropped to 1 update/s briefly."
                 )
             else:
                 if now > self._aimd_drop_until and self._aimd_rate_cap < self.max_updates_per_s:
-                    # Gradually ramp back up (+0.5 update/s per second)
-                    self._aimd_rate_cap = min(self.max_updates_per_s, self._aimd_rate_cap + 0.5)
+                    # Rapidly ramp back up (+2.5 update/s per second)
+                    self._aimd_rate_cap = min(self.max_updates_per_s, self._aimd_rate_cap + 2.5)
 
             if success:
                 # Minimum 2ms pacing delay

@@ -167,12 +167,29 @@ def main():
         print(f"[Hotkeys] Warning: {e}")
 
     # 6. Desktop GUI Instance
-    gui = TapoGUI(hub, on_quit=on_quit)
+    default_gui_mode = config.get("gui", {}).get("default_mode", "tray") if isinstance(config.get("gui"), dict) else "tray"
+    gui = TapoGUI(hub, on_quit=on_quit, default_mode=default_gui_mode)
 
     def show_dashboard():
         def _do():
             try:
                 gui.show_window()
+            except Exception:
+                pass
+        gui.app.after(0, _do)
+
+    def show_tray_mode():
+        def _do():
+            try:
+                gui.toggle_tray_window()
+            except Exception:
+                pass
+        gui.app.after(0, _do)
+
+    def pop_out_mode():
+        def _do():
+            try:
+                gui.pop_out()
             except Exception:
                 pass
         gui.app.after(0, _do)
@@ -197,6 +214,8 @@ def main():
         on_screen_toggle=lambda: hub.toggle_screen("all"),
         on_show_dashboard=show_dashboard,
         on_hide_dashboard=lambda: gui.app.after(0, gui.hide_window),
+        on_show_tray=show_tray_mode,
+        on_pop_out=pop_out_mode,
         on_quit=on_quit,
     )
     tray.run()

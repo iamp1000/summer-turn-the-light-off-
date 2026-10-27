@@ -239,19 +239,20 @@ class AnimationEngine:
             b_val = int(50 + norm_drift * 12)
             return int(h_val), int(s_val), max(1, min(100, b_val))
 
-        # 2. Fireplace: soft, low-frequency ember and flame movement for the L900.
+        # 2. Fireplace: rich hearth with ember simmer, crackle flare, and warm ash cooling
         elif eff_name == "fireplace":
             simmer = (
-                math.sin(t * 0.85) * 0.34
-                + math.sin(t * 1.30 + 0.8) * 0.24
-                + math.sin(t * 2.0 + 1.9) * 0.12
+                math.sin(t * 0.72) * 0.30
+                + math.sin(t * 1.15 + 0.9) * 0.22
+                + math.sin(t * 1.85 + 2.1) * 0.12
             )
-            surge_osc = math.sin(t * 0.34 + 2.1)
-            surge = max(0.0, (surge_osc - 0.45) / 0.55) ** 2.0
-            intensity = max(0.0, 0.60 * (simmer + 1.0) * 0.5 + 0.40 * surge)
-            h_val = int(18 + intensity * 16)
-            s_val = int(97 - surge * 9)
-            b_val = int(max(24, min(72, 24 + intensity * 48)))
+            crackle_phase = math.sin(t * 0.38 + 1.7)
+            surge = max(0.0, (crackle_phase - 0.40) / 0.60) ** 1.8
+            intensity = max(0.0, min(1.0, 0.55 * (simmer + 1.0) * 0.5 + 0.45 * surge))
+            # Shift from deep charcoal ember (19°) to leaping golden-orange flame (33°)
+            h_val = int(19 + intensity * 14)
+            s_val = int(97 - surge * 11)
+            b_val = int(max(24, min(72, 25 + intensity * 46)))
             return int(h_val), int(s_val), b_val
 
 
@@ -315,16 +316,17 @@ class AnimationEngine:
 
 
 
-        # 6. Candle Flicker: slow, restrained flame flutter with a narrow brightness range.
+        # 6. Candle Flicker: lively inharmonic flame flutter with gentle thermal drafts
         elif eff_name == "candle_flicker":
-            f1 = math.sin(t * 0.95) * 0.22
-            f2 = math.cos(t * 1.65) * 0.10
-            draft = -0.14 if math.sin(t * 0.42) > 0.88 else 0.0
-            flutter = f1 + f2 + draft + random.uniform(-0.035, 0.035)
-            norm_flame = max(0.0, min(1.0, 0.60 + flutter))
-            h_val = int(26 + norm_flame * 8)
-            s_val = int(96 - norm_flame * 8)
-            b_val = int(max(25, min(62, 25 + norm_flame * 42)))
+            f1 = math.sin(t * 1.15) * 0.18
+            f2 = math.cos(t * 1.95 + 0.6) * 0.12
+            f3 = math.sin(t * 2.80 + 1.4) * 0.08
+            draft = -0.09 if math.sin(t * 0.45) > 0.88 else 0.0
+            flutter = f1 + f2 + f3 + draft + random.uniform(-0.02, 0.02)
+            norm_flame = max(0.0, min(1.0, 0.58 + flutter))
+            h_val = int(26 + norm_flame * 7)
+            s_val = int(96 - norm_flame * 7)
+            b_val = int(max(25, min(62, 25 + norm_flame * 36)))
             return int(h_val), int(s_val), b_val
 
 

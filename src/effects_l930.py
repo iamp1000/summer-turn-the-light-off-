@@ -26,6 +26,7 @@ import math
 import random
 import threading
 import time
+import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("tapo")
@@ -34,6 +35,7 @@ from plugp100.api.light_effect import LightEffect
 from plugp100.api.light_effect_preset import LightEffectPreset
 from src.frame_bus import FramePacket, OutputProducer
 from src.pipeline import RenderPipeline
+from src.music_dynamics import ZoneTemporalSmoother
 from src.firmware_effects import (
     PALETTES,
     get_palette_hsv,
@@ -730,6 +732,60 @@ EFFECT_CATALOG: Dict[str, Dict[str, Any]] = {
         'alias_of': 'radial_ripple',
         'supported_controls': ['speed', 'brightness', 'palette', 'wave_width'],
     },
+
+    # ── 6. Extended WLED 1D Effects (25) ───────────────────────────────────
+    'android': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Section of varying length running along the strip', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'palette', 'wave_width']},
+    'blink': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Blinks between primary and secondary color', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'blink_rainbow': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Cycles through the rainbow with duty cycle blink', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'colorloop': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Cycle all LEDs through the rainbow colors synchronously', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'colorwaves': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Multi-sine harmonic palette wash across zones', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness', 'palette', 'wave_width']},
+    'chase_rainbow': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': '2 LEDs running leaving a decaying rainbow trail', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'chase_flash': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Wandering flashing LEDs on lit strip', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'chase_random': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Running pulse that changes random color per pass', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'colorful': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Shifting Red-Amber-Green-Blue quadrant bands', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'dynamic': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Randomized IC palette morph with smooth blending', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'dynamic_smooth': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Smooth Perlin noise advection across palette', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'fade': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Smooth crossfade between primary and secondary colors', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'glitter': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Palette background with high-frequency white sparkles', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'particle_density']},
+    'loading': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Moving sawtooth ramp filling and resetting along the strip', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'percent': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Lights up a percentage of strip like a progress meter', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'plasma_1d': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Multi-phase 1D plasma wave oscillation', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'palette', 'wave_width']},
+    'popcorn': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Popping kernels with random ballistic jumps', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'particle_density']},
+    'pride_2015': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'FastLED Pride 2015 rainbow cycling with brightness variation', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'running': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Smooth scrolling sine waves along the strip', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness', 'palette', 'wave_width']},
+    'saw': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Sawtooth waves scrolling with speed and width', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'palette', 'wave_width']},
+    'scan': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Single primary colored light wandering between start and end', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'palette', 'wave_width']},
+    'scanner_dual': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Two dots scanning in opposite directions leaving trails', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'palette', 'wave_width']},
+    'sparkle': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Single random LEDs light up in primary color with secondary background', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'theater_rainbow': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Classic marquee chasing running lights in rainbow colors', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'wipe': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Progressive color reveal wipe from start to end', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'palette']},
+
+    # ── 7. Extended WLED 2D Effects (25) ───────────────────────────────────
+    'matrix_rain': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Digital rain cascade down spatial field', 'default_palette': 'forest', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'metaballs_2d': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': '2D plasma metaballs merging and separating', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'palette']},
+    'game_of_life': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Cellular automata glider pattern traversing room space', 'default_palette': 'forest', 'supported_controls': ['speed', 'brightness']},
+    'tartan': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Horizontal and vertical plaid bands intersecting in space', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'polar_lights': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Undulating northern lights curtains in emerald and violet', 'default_palette': 'forest', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'drift_rose': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Spinning rose petals winding and unwinding in polar space', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'crazy_bees': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Swarm of bees darting around flower centers', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness', 'particle_density']},
+    'colored_bursts': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Rotating spectral rays radiating from center', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'swirl': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Interlocking blurred swirling circles', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness']},
+    'sindots': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Ring of dots revolving on a 3D tilted circle projection', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness']},
+    'dna': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Double helix rotating projection with crossing nodes', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'tv_simulator': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Atmospheric screen glow fluctuation simulating living room television', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness']},
+    'sun_radiation': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Pulsing solar corona flare expanding outward', 'default_palette': 'fire', 'supported_controls': ['speed', 'brightness']},
+    'soap_bubbles': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Floating translucent iridescent soap bubble spheres drifting slowly', 'default_palette': 'pastel', 'supported_controls': ['speed', 'brightness', 'particle_density']},
+    'spaceships': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Fast moving dogfight particles orbiting and leaving weapon trails', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'octopus': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Cephalopod center with undulating curved tentacles waving outwards', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness']},
+    'waving_cell': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Stadium wave ripple undulating back and forth across cell membrane', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'plasma_ball': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'High-energy lightning plasma filaments reaching towards touch points', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness']},
+    'freqmatrix': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Cascading audio waterfall frequency bars mapped onto 50 zones', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'freqwave': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Audio spectrum flowing through HSV space', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness']},
+    'waterfall_audio': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Waterfall cascade from apex down', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness', 'wave_width']},
+    'puddles': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Concentric puddle impacts blasting outwards', 'default_palette': 'tide', 'supported_controls': ['speed', 'brightness']},
+    'gravcenter': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Center outward gravity VU meter wave', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
+    'waverly': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Acoustic sound noise displacement ripples', 'default_palette': 'dusk', 'supported_controls': ['speed', 'brightness']},
+    'akemi': {'kind': 'streamed_slow', 'group': 'Motion', 'category': 'creative', 'desc': 'Kinetic rhythmic bobbing & dancing WLED mascot', 'default_palette': 'sunset', 'supported_controls': ['speed', 'brightness']},
 }
 
 # A 50-effect audition shelf based on recognizable WLED 1D and 2D effect families.
@@ -741,6 +797,11 @@ WLED_1D_EFFECTS: List[str] = [
     "sinelon", "cyber_chase", "raindrop", "lightning", "rainbow", "fireflies",
     "starfield", "embers", "breathe", "candy_cane", "police", "neon_heartbeat",
     "tide", "lantern_sweep", "prism_sparks",
+    "android", "blink", "blink_rainbow", "colorloop", "colorwaves",
+    "chase_rainbow", "chase_flash", "chase_random", "colorful", "dynamic",
+    "dynamic_smooth", "fade", "glitter", "loading", "percent",
+    "plasma_1d", "popcorn", "pride_2015", "running", "saw",
+    "scan", "scanner_dual", "sparkle", "theater_rainbow", "wipe",
 ]
 WLED_2D_EFFECTS: List[str] = [
     "spiral_vortex", "gravity_slosh", "lissajous_orbit", "planar_wind", "radar_sweep",
@@ -748,6 +809,11 @@ WLED_2D_EFFECTS: List[str] = [
     "chromatic_undertow", "black_hole", "ps_fire", "ps_waterfall", "ps_vortex",
     "ps_fireworks", "ps_volcano", "ps_ballpit", "ps_box", "ps_fuzzy_noise",
     "ps_impact", "ps_attractor", "ps_spray", "ps_geq_nova", "ps_ghost_rider", "ps_blobs",
+    "matrix_rain", "metaballs_2d", "game_of_life", "tartan", "polar_lights",
+    "drift_rose", "crazy_bees", "colored_bursts", "swirl", "sindots",
+    "dna", "tv_simulator", "sun_radiation", "soap_bubbles", "spaceships",
+    "octopus", "waving_cell", "plasma_ball", "freqmatrix", "freqwave",
+    "waterfall_audio", "puddles", "gravcenter", "waverly", "akemi",
 ]
 EFFECT_DIMENSIONS: Dict[str, str] = {
     **{name: "1D" for name in WLED_1D_EFFECTS},
@@ -766,13 +832,8 @@ CUSTOM_EFFECTS = list(ACTIVE_EFFECTS)
 
 for _effect_name in ACTIVE_EFFECTS:
     _effect_meta = EFFECT_CATALOG[_effect_name]
-    # These effects render locally as 50-zone HSV frames; they are not native
-    # WLED firmware effects running inside the Tapo controller.
-    _effect_meta["kind"] = "streamed_slow"
-    _effect_meta["group"] = "Motion"
-    _effect_meta["category"] = "creative"
     _effect_meta["dimension"] = EFFECT_DIMENSIONS[_effect_name]
-    _effect_meta["tags"] = f"WLED-inspired · {EFFECT_DIMENSIONS[_effect_name]} · software renderer"
+    _effect_meta["tags"] = f"WLED-inspired · {EFFECT_DIMENSIONS[_effect_name]} · {_effect_meta.get('kind', 'streamed_slow')}"
 
 WLED_DISPLAY_NAMES: Dict[str, str] = {
     "juggle": "Juggle", "colortwinkles": "Color Twinkles", "meteor_shower": "Meteor",
@@ -793,6 +854,26 @@ WLED_DISPLAY_NAMES: Dict[str, str] = {
     "ps_ballpit": "PS Ballpit (2D)", "ps_box": "PS Box (2D)", "ps_fuzzy_noise": "PS Fuzzy Noise (2D)",
     "ps_impact": "PS Impact (2D)", "ps_attractor": "PS Attractor (2D)", "ps_spray": "PS Spray (2D)",
     "ps_geq_nova": "PS GEQ Nova (2D)", "ps_ghost_rider": "PS Ghost Rider (2D)", "ps_blobs": "PS Blobs (2D)",
+    "android": "Android", "blink": "Blink", "blink_rainbow": "Blink Rainbow",
+    "colorloop": "Colorloop", "colorwaves": "Colorwaves", "chase_rainbow": "Chase Rainbow",
+    "chase_flash": "Chase Flash", "chase_random": "Chase Random", "colorful": "Colorful",
+    "dynamic": "Dynamic", "dynamic_smooth": "Dynamic Smooth", "fade": "Fade",
+    "glitter": "Glitter", "loading": "Loading", "percent": "Percent",
+    "plasma_1d": "Plasma 1D", "popcorn": "Popcorn", "pride_2015": "Pride 2015",
+    "running": "Running", "saw": "Saw", "scan": "Scan", "scanner_dual": "Scanner Dual",
+    "sparkle": "Sparkle", "theater_rainbow": "Theater Rainbow", "wipe": "Wipe",
+    "matrix_rain": "Matrix Rain (2D)", "metaballs_2d": "Metaballs (2D)",
+    "game_of_life": "Game Of Life (2D)", "tartan": "Tartan (2D)",
+    "polar_lights": "Polar Lights (2D)", "drift_rose": "Drift Rose (2D)",
+    "crazy_bees": "Crazy Bees (2D)", "colored_bursts": "Colored Bursts (2D)",
+    "swirl": "Swirl (2D)", "sindots": "Sindots (2D)", "dna": "DNA (2D)",
+    "tv_simulator": "TV Simulator", "sun_radiation": "Sun Radiation (2D)",
+    "soap_bubbles": "Soap Bubbles (2D)", "spaceships": "Spaceships (2D)",
+    "octopus": "Octopus (2D)", "waving_cell": "Waving Cell (2D)",
+    "plasma_ball": "Plasma Ball (2D)", "freqmatrix": "Freqmatrix (Audio 2D)",
+    "freqwave": "Freqwave (Audio 2D)", "waterfall_audio": "Waterfall (Audio 2D)",
+    "puddles": "Puddles (Audio 2D)", "gravcenter": "Gravcenter (Audio 2D)",
+    "waverly": "Waverly (Audio 2D)", "akemi": "Akemi (Audio 2D)",
 }
 for _effect_name, _display_name in WLED_DISPLAY_NAMES.items():
     if _effect_name in EFFECT_CATALOG:
@@ -841,8 +922,9 @@ class L930EffectsEngine:
         self._pending_fw_timer: Optional[threading.Timer] = None
         self._fw_lock = threading.Lock()
 
-        # Dedicated pre-correction pipeline
+        # Dedicated pre-correction pipeline & inter-frame temporal smoother
         self._pipeline = RenderPipeline(gamma=2.2, r_calib=1.0, g_calib=0.96, b_calib=0.90)
+        self._stream_smoother = ZoneTemporalSmoother(num_zones=NUM_SEGMENTS, attack_tau=0.020, decay_tau=0.040)
 
         # Procedural simulation state for slow streamed effects
         self._heat = [0.0] * NUM_SEGMENTS
@@ -1793,15 +1875,15 @@ class L930EffectsEngine:
                     self._compute_raw(eff, 0.0),
                     master_ceiling=self._brightness / 100.0,
                 )
-                zones_per_step = 5
-                step_interval = 0.50
+                zones_per_step = 2
+                step_interval = 0.015
                 for visible in range(zones_per_step, NUM_SEGMENTS + zones_per_step, zones_per_step):
                     if stop_event.is_set() or generation != self._effect_generation:
                         return
                     frame_data = {
                         "segments": _build_wipe_segments(target, visible),
                         "brightness": self._brightness,
-                        "transition": 200,
+                        "transition": 40,
                         "_pre_corrected": True,
                     }
                     if self._output_token is None:
@@ -1872,20 +1954,21 @@ class L930EffectsEngine:
                         self._app_state["last_error"] = self._last_error
                     return
 
-                # Respect a conservative minimum cadence, then let live hardware
-                # latency/AIMD protection extend the interval when necessary.
-                interval = max(0.20, interval)
+                # Dynamic hardware adaptation: match live controller send budget
+                ctrl_interval = getattr(self._ctrl, "current_interval", None)
+                if ctrl_interval is not None:
+                    interval = max(0.100, float(ctrl_interval))
+                else:
+                    base_ups = float(getattr(self._ctrl, "_max_updates_per_s", 8.0)) if hasattr(self._ctrl, "_max_updates_per_s") else 8.0
+                    sender = getattr(self._ctrl, "frame_sender", None)
+                    if sender:
+                        aimd_cap = float(getattr(sender, "_aimd_rate_cap", base_ups))
+                        effective_ups = max(1.0, min(base_ups, aimd_cap))
+                    else:
+                        effective_ups = base_ups
+                    interval = max(0.080, 1.0 / effective_ups)
 
-                # Dynamic hardware adaptation: if controller throttled under AIMD or RTT latency, lengthen interval
-                if hasattr(self._ctrl, "current_interval"):
-                    interval = max(interval, float(self._ctrl.current_interval))
-                elif hasattr(self._ctrl, "_current_interval") and self._ctrl._current_interval:
-                    interval = max(interval, float(self._ctrl._current_interval))
-                elif hasattr(self._ctrl, "frame_sender") and self._ctrl.frame_sender:
-                    aimd_cap = getattr(self._ctrl.frame_sender, "_aimd_rate_cap", 2.0)
-                    interval = max(interval, 1.0 / max(0.5, aimd_cap))
-
-                trans_ms = max(80, int(round(interval * 1000)))
+                trans_ms = max(60, min(6000, int(round(interval * 1000.0))))
 
                 # Early stale frame guard before CPU color correction
                 if generation != self._effect_generation or stop_event.is_set():
@@ -1895,13 +1978,15 @@ class L930EffectsEngine:
                 b = self._brightness
                 master_ceiling = b / 100.0
                 corrected = self._pipeline.correct_hsv_sequence(segs, master_ceiling=master_ceiling)
+                # Temporal smoothing between frames for fluid procedural animation
+                smoothed = self._stream_smoother.process(corrected, dt=interval)
 
                 # Stale frame guard right before publishing or submitting
                 if generation != self._effect_generation or stop_event.is_set():
                     break
 
                 frame_data = {
-                    "segments": corrected,
+                    "segments": smoothed,
                     "brightness": b,
                     "transition": trans_ms,
                     "_pre_corrected": True,
@@ -1941,6 +2026,546 @@ class L930EffectsEngine:
                     break
 
     # ── Procedural Streamed Models ───────────────────────────────────────────
+
+
+    def _render_wled_1d_ext(self, name: str, t: float) -> List[List[int]]:
+        """Extended catalog of 25 WLED 1D procedural designs."""
+        from src.visual_styles import sample_palette_oklab
+        sp = max(0.2, self._speed)
+        ww = max(0.3, min(3.0, getattr(self, "_wave_width", 1.0)))
+        density = max(0.2, min(3.0, getattr(self, "_particle_density", 1.0)))
+        pal = get_palette_hsv(self._palette_name if self._palette_name in PALETTES else "sunset")
+        out = []
+
+        if name == "android":
+            head = (t * 8.0 * sp) % NUM_SEGMENTS
+            length = (7.0 + 4.0 * math.sin(t * 1.7 * sp)) * ww
+            for i in range(NUM_SEGMENTS):
+                dist = (i - head) % NUM_SEGMENTS
+                if dist < length:
+                    tail_fade = max(0.0, min(1.0, (length - dist) / 1.5))
+                    head_fade = max(0.0, min(1.0, (dist + 0.5) / 1.5))
+                    alpha = tail_fade * head_fade
+                    frac = dist / max(1.0, length)
+                    h, s, _ = sample_palette_oklab(pal, frac, cyclic=True)
+                    v = int(max(15, min(95, 15 + alpha * (80 - 30 * frac))))
+                else:
+                    h, s, _ = sample_palette_oklab(pal, 0.0, cyclic=True)
+                    v = 15
+                out.append([h, s, v])
+
+        elif name == "blink":
+            for i in range(NUM_SEGMENTS):
+                spatial_blend = (math.sin(t * 3.5 * sp + i * 0.15) + 1.0) * 0.5
+                h, s, _ = sample_palette_oklab(pal, spatial_blend * 0.5, cyclic=True)
+                v = int(max(15, min(85, 20 + spatial_blend * 65)))
+                out.append([h, s, v])
+
+        elif name == "blink_rainbow":
+            blink_state = 1 if (math.sin(t * 4.0 * sp) > -0.2) else 0
+            for i in range(NUM_SEGMENTS):
+                h = int((t * 50.0 * sp + i * 7.2) % 360)
+                v = int(max(10, min(100, 90 * blink_state + 15)))
+                out.append([h, 85, v])
+
+        elif name == "colorloop":
+            base_hue = (t * 45.0 * sp) % 360
+            for i in range(NUM_SEGMENTS):
+                h = int((base_hue + i * 2.2) % 360)
+                v = int(max(20, min(100, 75 + 20 * math.sin(t * 2.0 * sp + i * 0.2))))
+                out.append([h, 85, v])
+
+        elif name == "colorwaves":
+            for i in range(NUM_SEGMENTS):
+                x = i / float(NUM_SEGMENTS)
+                w1 = math.sin(x * (5.0 / ww) * math.pi + t * 1.5 * sp)
+                w2 = math.cos(x * (9.0 / ww) * math.pi - t * 2.1 * sp)
+                w3 = math.sin(x * (3.0 / ww) * math.pi + t * 0.8 * sp)
+                wave = (w1 + w2 + w3) / 3.0
+                norm_w = (wave + 1.0) * 0.5
+                h, s, _ = sample_palette_oklab(pal, norm_w, cyclic=True)
+                v = int(max(15, min(100, 30 + norm_w * 70)))
+                out.append([h, s, v])
+
+        elif name == "chase_rainbow":
+            head = (t * 14.0 * sp) % NUM_SEGMENTS
+            tail_span = 14.0 * ww
+            for i in range(NUM_SEGMENTS):
+                dist = (head - i) % NUM_SEGMENTS
+                h = int((dist * 18.0 + t * 40.0 * sp) % 360)
+                decay = math.exp(-dist / max(1.0, tail_span))
+                v = int(max(8, min(100, 15 + decay * 85)))
+                out.append([h, 85, v])
+
+        elif name == "chase_flash":
+            head = (t * 9.0 * sp) % NUM_SEGMENTS
+            strobe = (math.sin(t * 18.0 * sp) + 1.0) * 0.5
+            for i in range(NUM_SEGMENTS):
+                dist = min(abs(i - head), abs(i - head + NUM_SEGMENTS), abs(i - head - NUM_SEGMENTS))
+                glow = math.exp(-0.5 * (dist / 1.4) ** 2)
+                h, s, _ = sample_palette_oklab(pal, 0.75 * glow + 0.15 * (1.0 - glow), cyclic=True)
+                v = int(max(20, min(95, 25 + glow * (30 + 40 * strobe))))
+                out.append([h, s, v])
+
+        elif name == "chase_random":
+            pass_num = int(t * 8.0 * sp / NUM_SEGMENTS)
+            head = (t * 8.0 * sp) % NUM_SEGMENTS
+            h_pass = int((pass_num * 137.5) % 360)
+            tail_span = 8.0 * ww
+            for i in range(NUM_SEGMENTS):
+                dist = (head - i) % NUM_SEGMENTS
+                decay = math.exp(-dist / max(1.0, tail_span))
+                v = int(max(8, min(100, 12 + decay * 88)))
+                out.append([h_pass, 85, v])
+
+        elif name == "colorful":
+            for i in range(NUM_SEGMENTS):
+                quad = ((i / float(NUM_SEGMENTS)) * 4.0 + t * 0.4 * sp) % 4.0
+                h, s, _ = sample_palette_oklab(pal, quad / 4.0, cyclic=True)
+                v = int(max(15, min(100, 50 + 45 * math.sin(quad * math.pi))))
+                out.append([h, s, v])
+
+        elif name == "dynamic":
+            for i in range(NUM_SEGMENTS):
+                seed = math.sin(i * 12.9898 + int(t * 1.5 * sp) * 4.1415)
+                h = int(((seed + 1.0) * 0.5 * 360.0 + t * 20.0 * sp) % 360)
+                s = int(max(60, min(95, 75 + 20 * math.cos(i * 3.3))))
+                v = int(max(15, min(100, 45 + 50 * math.sin(t * 3.0 * sp + i * 1.1))))
+                out.append([h, s, v])
+
+        elif name == "dynamic_smooth":
+            for i in range(NUM_SEGMENTS):
+                n1 = math.sin(i * 0.18 + t * 0.9 * sp)
+                n2 = math.cos(i * 0.35 - t * 1.3 * sp)
+                val_norm = (n1 * 0.6 + n2 * 0.4 + 1.0) * 0.5
+                h, s, _ = sample_palette_oklab(pal, val_norm, cyclic=True)
+                v = int(max(12, min(100, 20 + val_norm * 80)))
+                out.append([h, s, v])
+
+        elif name == "fade":
+            fade_p = (math.sin(t * 1.8 * sp) + 1.0) * 0.5
+            for i in range(NUM_SEGMENTS):
+                zone_p = (fade_p + i * 0.008) % 1.0
+                h, s, _ = sample_palette_oklab(pal, zone_p, cyclic=True)
+                v = int(max(15, min(100, 35 + 60 * math.sin(zone_p * math.pi))))
+                out.append([h, s, v])
+
+        elif name == "glitter":
+            for i in range(NUM_SEGMENTS):
+                h_base = int((i * 4.0 + t * 15.0 * sp) % 360)
+                sparkle_seed = math.sin(i * 54.321 + int(t * 9.0 * sp) * 98.76)
+                is_sparkle = sparkle_seed > (0.95 - 0.20 * density)
+                if is_sparkle:
+                    out.append([0, 0, 100])
+                else:
+                    out.append([h_base, 80, 25])
+
+        elif name == "loading":
+            period = 3.0 / sp
+            prog = (t % period) / period
+            exact_len = max(1.0, prog * NUM_SEGMENTS)
+            for i in range(NUM_SEGMENTS):
+                coverage = max(0.0, min(1.0, exact_len - i + 0.5))
+                h, s, _ = sample_palette_oklab(pal, (i / max(1.0, NUM_SEGMENTS)), cyclic=True)
+                v = int(max(12, min(95, 15 + coverage * 80)))
+                out.append([h, s, v])
+
+        elif name == "percent":
+            meter = (math.sin(t * 1.4 * sp) + 1.0) * 0.5
+            exact_len = meter * NUM_SEGMENTS
+            for i in range(NUM_SEGMENTS):
+                coverage = max(0.0, min(1.0, exact_len - i + 0.5))
+                h, s, _ = sample_palette_oklab(pal, (i / max(1.0, NUM_SEGMENTS)), cyclic=True)
+                v = int(max(12, min(90, 12 + coverage * 78)))
+                out.append([h, s, v])
+
+        elif name == "plasma_1d":
+            for i in range(NUM_SEGMENTS):
+                x = i / float(NUM_SEGMENTS)
+                p1 = math.sin(x * (8.0 / ww) + t * 2.0 * sp)
+                p2 = math.sin(x * (14.0 / ww) - t * 1.7 * sp)
+                p3 = math.sin((x * 10.0 + t * 3.0 * sp) / ww)
+                p = (p1 + p2 + p3) / 3.0
+                norm_p = (p + 1.0) * 0.5
+                h, s, _ = sample_palette_oklab(pal, norm_p, cyclic=True)
+                v = int(max(15, min(100, 25 + norm_p * 75)))
+                out.append([h, s, v])
+
+        elif name == "popcorn":
+            num_kernels = max(2, min(8, int(round(4 * density))))
+            heat_map = [0.0] * NUM_SEGMENTS
+            for k in range(num_kernels):
+                k_t = (t * 1.5 * sp + k * 1.618) % 2.0
+                k_pos = (k * 13.7 + k_t * 6.0) % NUM_SEGMENTS
+                k_bright = max(0.0, 1.0 - (k_t / 2.0))
+                # Smooth sub-pixel Gaussian distribution across neighboring ICs
+                for i in range(NUM_SEGMENTS):
+                    dist = abs(i - k_pos)
+                    if dist < 4.0:
+                        glow = math.exp(-0.5 * (dist / 1.45) ** 2) * k_bright
+                        heat_map[i] = max(heat_map[i], glow)
+            for i in range(NUM_SEGMENTS):
+                pop = heat_map[i]
+                h = int((30 + pop * 25) % 360)
+                s = int(max(20, min(95, 90 - pop * 60)))
+                v = int(max(10, min(100, 15 + pop * 85)))
+                out.append([h, s, v])
+
+        elif name == "pride_2015":
+            for i in range(NUM_SEGMENTS):
+                x = i / float(NUM_SEGMENTS)
+                wave1 = math.sin(x * 6.0 * math.pi + t * 1.1 * sp)
+                wave2 = math.cos(x * 4.0 * math.pi - t * 1.7 * sp)
+                h = int((x * 360.0 + t * 35.0 * sp + wave1 * 30.0) % 360)
+                v = int(max(18, min(100, 45 + 50 * ((wave1 + wave2) * 0.25 + 0.5))))
+                out.append([h, 85, v])
+
+        elif name == "running":
+            for i in range(NUM_SEGMENTS):
+                x = i / float(NUM_SEGMENTS)
+                run_p = math.sin(x * (10.0 / ww) * math.pi - t * 3.5 * sp)
+                norm_p = (run_p + 1.0) * 0.5
+                h, s, _ = sample_palette_oklab(pal, norm_p, cyclic=True)
+                v = int(max(15, min(100, 20 + norm_p * 80)))
+                out.append([h, s, v])
+
+        elif name == "saw":
+            for i in range(NUM_SEGMENTS):
+                phase = ((i / (12.0 * ww)) - t * 2.2 * sp) % 1.0
+                smooth_saw = phase if phase < 0.90 else (1.0 - (phase - 0.90) / 0.10)
+                h, s, _ = sample_palette_oklab(pal, smooth_saw, cyclic=True)
+                v = int(max(15, min(95, 15 + smooth_saw * 80)))
+                out.append([h, s, v])
+
+        elif name == "scan":
+            pos = 24.5 + 24.0 * math.sin(t * 1.6 * sp)
+            beam_w = 2.5 * ww
+            for i in range(NUM_SEGMENTS):
+                dist = abs(i - pos)
+                glow = math.exp(-0.5 * (dist / max(0.5, beam_w)) ** 2)
+                h, s, _ = sample_palette_oklab(pal, 0.5, cyclic=True)
+                v = int(max(10, min(100, 12 + glow * 88)))
+                out.append([h, s, v])
+
+        elif name == "scanner_dual":
+            pos1 = 24.5 + 24.0 * math.sin(t * 1.8 * sp)
+            pos2 = 24.5 - 24.0 * math.sin(t * 1.8 * sp)
+            beam_w = max(1.8, 2.2 * ww)
+            for i in range(NUM_SEGMENTS):
+                d1 = abs(i - pos1)
+                d2 = abs(i - pos2)
+                g1 = math.exp(-0.5 * (d1 / max(0.5, beam_w)) ** 2)
+                g2 = math.exp(-0.5 * (d2 / max(0.5, beam_w)) ** 2)
+                h, s, _ = sample_palette_oklab(pal, 0.2 if g1 > g2 else 0.8, cyclic=True)
+                v = int(max(10, min(100, 12 + max(g1, g2) * 88)))
+                out.append([h, s, v])
+
+        elif name == "sparkle":
+            for i in range(NUM_SEGMENTS):
+                sp_seed = math.sin(i * 37.17 + t * 4.5 * sp)
+                flare = max(0.0, sp_seed) ** 8.0
+                h, s, _ = sample_palette_oklab(pal, 0.0 if flare > 0.3 else 0.6, cyclic=True)
+                v = int(max(18, min(95, 18 + flare * 75)))
+                out.append([h, s, v])
+
+        elif name == "theater_rainbow":
+            for i in range(NUM_SEGMENTS):
+                wave = (math.cos((i - t * 6.0 * sp) * (2.0 * math.pi / 3.0)) + 1.0) * 0.5
+                h = int((i * 7.2 + t * 45.0 * sp) % 360)
+                v = int(max(15, min(95, 15 + (wave ** 3.0) * 80)))
+                out.append([h, 90, v])
+
+        elif name == "wipe":
+            period = 4.0 / sp
+            prog = (t % period) / period
+            pass_num = int(t / period)
+            exact_head = prog * NUM_SEGMENTS
+            c1_frac = (pass_num * 0.3) % 1.0
+            c2_frac = ((pass_num + 1) * 0.3) % 1.0
+            for i in range(NUM_SEGMENTS):
+                # Anti-aliased smoothstep transition along the wipe wavefront
+                blend = _smoothstep(-1.2, 1.2, exact_head - i)
+                frac = (c1_frac * (1.0 - blend) + c2_frac * blend) % 1.0
+                h, s, _ = sample_palette_oklab(pal, frac, cyclic=True)
+                v = int(max(20, min(85, 35 + blend * 50)))
+                out.append([h, s, v])
+
+        return out
+
+    def _render_wled_2d_ext(self, name: str, t: float) -> List[List[int]]:
+        """Extended catalog of 25 WLED 2D spatial designs with continuous sub-pixel zone mapping."""
+        from src.visual_styles import sample_palette_oklab
+        sp = max(0.2, self._speed)
+        ww = max(0.3, min(3.0, getattr(self, "_wave_width", 1.0)))
+        density = max(0.2, min(3.0, getattr(self, "_particle_density", 1.0)))
+        pal = get_palette_hsv(self._palette_name if self._palette_name in PALETTES else "sunset")
+        out = []
+
+        for zone in range(NUM_SEGMENTS):
+            # Continuous sub-pixel phase angle around the strip (0 to 2*pi, 7.2 degrees per zone)
+            continuous_angle = (zone / float(NUM_SEGMENTS)) * 2.0 * math.pi
+            # Normalized progression along the physical strip (0.0 to 1.0)
+            t_strip = zone / float(max(1, NUM_SEGMENTS - 1))
+            # Monotonic continuous horizontal coordinate from -1.0 to 1.0 (smooth 0.0408 delta per zone)
+            continuous_x = -1.0 + 2.0 * t_strip
+            continuous_y = math.sin(continuous_angle) * 0.75
+            centered_r = abs(zone - 24.5) / 24.5
+
+            x = continuous_x
+            y = continuous_y
+            radius = centered_r
+            angle = continuous_angle
+            brightness = 15.0
+            h_val = 0
+            s_val = 85
+
+            if name == "matrix_rain":
+                col_x = math.floor((x + 1.0) * 4.0 / ww)
+                y_drop = (y + 1.0) * 0.5
+                lead_t = (t * 1.5 * sp + col_x * 0.53) % 2.0
+                dist_lead = (2.0 - lead_t) - y_drop
+                if 0.0 <= dist_lead <= 1.2:
+                    trail = math.exp(-dist_lead * 2.2)
+                    brightness = 15 + 65 * trail
+                    h_val = 140 if dist_lead < 0.15 else 120
+                    s_val = 45 if dist_lead < 0.1 else 95
+                else:
+                    brightness = 15
+                    h_val = 120
+                    s_val = 90
+
+            elif name == "metaballs_2d":
+                m1_x, m1_y = 0.5 * math.cos(t * 1.3 * sp), 0.5 * math.sin(t * 1.7 * sp)
+                m2_x, m2_y = 0.6 * math.cos(t * 0.9 * sp + 2.0), 0.4 * math.sin(t * 1.1 * sp + 1.0)
+                m3_x, m3_y = 0.4 * math.sin(t * 1.5 * sp + 4.0), 0.5 * math.cos(t * 0.8 * sp + 3.0)
+                d1 = math.sqrt((x - m1_x) ** 2 + (y - m1_y) ** 2) + 0.15
+                d2 = math.sqrt((x - m2_x) ** 2 + (y - m2_y) ** 2) + 0.15
+                d3 = math.sqrt((x - m3_x) ** 2 + (y - m3_y) ** 2) + 0.15
+                field = (0.2 / d1) + (0.2 / d2) + (0.2 / d3)
+                norm_f = min(1.0, field * 0.5)
+                h, s, _ = sample_palette_oklab(pal, norm_f, cyclic=True)
+                h_val, s_val = h, s
+                brightness = max(12, min(100, 20 + norm_f * 80))
+
+            elif name == "game_of_life":
+                g_phase = (x * 3.0 + y * 3.0 - t * 2.5 * sp) % 4.0
+                cell = (math.sin(g_phase * math.pi) + 1.0) * 0.5
+                alive = cell ** 2.5
+                h_val = int((120 + 60 * math.sin(t * sp)) % 360)
+                s_val = 85
+                brightness = 15 + alive * 65
+
+            elif name == "tartan":
+                h_line = 0.5 + 0.5 * math.sin(y * (8.0 / ww) * math.pi + t * 1.2 * sp)
+                v_line = 0.5 + 0.5 * math.cos(x * (8.0 / ww) * math.pi - t * 0.9 * sp)
+                plaid = (h_line * v_line)
+                norm_p = (h_line + v_line) * 0.5
+                h, s, _ = sample_palette_oklab(pal, norm_p, cyclic=True)
+                h_val, s_val = h, s
+                brightness = max(12, min(100, 18 + plaid * 82))
+
+            elif name == "polar_lights":
+                curtain = math.sin(x * (4.0 / ww) * math.pi + t * 0.8 * sp) * 0.3
+                dist_c = abs(y - curtain)
+                glow = math.exp(-0.5 * (dist_c / 0.35) ** 2)
+                h_val = int(140 + 120 * glow) % 360
+                s_val = int(80 + 15 * glow)
+                brightness = max(10, min(100, 12 + glow * 88))
+
+            elif name == "drift_rose":
+                k_petals = 3.0 + 2.0 * math.sin(t * 0.4 * sp)
+                rose_r = 0.6 * math.cos(k_petals * angle + t * 1.4 * sp)
+                diff = abs(radius - abs(rose_r))
+                glow = math.exp(-0.5 * (diff / (0.12 * ww)) ** 2)
+                h_val = int((angle * 180.0 / math.pi + t * 25.0 * sp) % 360)
+                s_val = 85
+                brightness = max(10, min(100, 12 + glow * 88))
+
+            elif name == "crazy_bees":
+                best_glow = 0.0
+                num_bees = max(2, min(8, int(round(4 * density))))
+                for b in range(num_bees):
+                    bx = 0.5 * math.sin(t * (2.0 + b * 0.5) * sp + b * 1.7)
+                    by = 0.5 * math.cos(t * (2.3 + b * 0.4) * sp + b * 2.3)
+                    d = math.sqrt((x - bx) ** 2 + (y - by) ** 2)
+                    g = math.exp(-0.5 * (d / 0.14) ** 2)
+                    if g > best_glow:
+                        best_glow = g
+                h_val = 45 if best_glow > 0.5 else 300
+                s_val = 90
+                brightness = max(10, min(100, 12 + best_glow * 88))
+
+            elif name == "colored_bursts":
+                rays = max(0.0, math.cos(angle * 6.0 + t * 2.2 * sp)) ** 4
+                h_val = int((angle * 180.0 / math.pi + t * 40.0 * sp) % 360)
+                s_val = 85
+                brightness = max(10, min(100, 15 + rays * 85))
+
+            elif name == "swirl":
+                twist = angle + radius * 8.0 - t * 2.0 * sp
+                arms = max(0.0, math.cos(twist * 3.0)) ** 3
+                h_val = int((twist * 180.0 / math.pi) % 360)
+                s_val = 85
+                brightness = max(12, min(100, 15 + arms * 85))
+
+            elif name == "sindots":
+                ring_phase = angle * 5.0 - t * 2.8 * sp
+                dots = max(0.0, math.cos(ring_phase)) ** 6
+                r_diff = abs(radius - 0.6)
+                r_glow = math.exp(-0.5 * (r_diff / 0.15) ** 2)
+                h_val = int((angle * 180.0 / math.pi + 180) % 360)
+                s_val = 80
+                brightness = max(10, min(100, 12 + dots * r_glow * 88))
+
+            elif name == "dna":
+                helix1 = 0.4 * math.sin(x * (6.0 / ww) + t * 2.2 * sp)
+                helix2 = -helix1
+                d1 = abs(y - helix1)
+                d2 = abs(y - helix2)
+                g1 = math.exp(-0.5 * (d1 / 0.18) ** 2)
+                g2 = math.exp(-0.5 * (d2 / 0.18) ** 2)
+                if g1 > g2:
+                    h_val, s_val = 190, 90
+                else:
+                    h_val, s_val = 320, 90
+                brightness = max(10, min(100, 14 + max(g1, g2) * 86))
+
+            elif name == "tv_simulator":
+                cut = int(t * 0.4 * sp)
+                sub_t = t * 0.4 * sp - cut
+                scene_h = int((cut * 83.1) % 360)
+                flicker = 0.8 + 0.2 * math.sin(t * 7.7 * sp)
+                dist_tv = math.sqrt(x ** 2 + (y + 0.6) ** 2)
+                falloff = 1.0 / (1.0 + dist_tv * 1.2)
+                h_val = int((scene_h + dist_tv * 30.0) % 360)
+                s_val = int(max(40, min(80, 55 + 20 * math.sin(dist_tv * 3.0))))
+                brightness = max(12, min(100, int((25 + 65 * (1.0 - sub_t * 0.5) * falloff) * flicker)))
+
+            elif name == "sun_radiation":
+                flare = math.sin(angle * 9.0 + t * 3.0 * sp) * 0.15
+                corona_r = 0.45 + flare
+                dist_c = abs(radius - corona_r)
+                glow = math.exp(-0.5 * (dist_c / 0.2) ** 2)
+                h_val = int(25 + 35 * glow)
+                s_val = 95
+                brightness = max(12, min(100, 15 + glow * 85))
+
+            elif name == "soap_bubbles":
+                best_g = 0.0
+                best_h = 0
+                num_bubbles = max(2, min(7, int(round(4 * density))))
+                for b in range(num_bubbles):
+                    bx = 0.6 * math.sin(b * 2.1 + t * 0.5 * sp)
+                    by = ((t * 0.4 * sp + b * 0.45) % 2.0) - 1.0
+                    d = math.sqrt((x - bx) ** 2 + (y - by) ** 2)
+                    ring = math.exp(-0.5 * ((d - 0.25) / 0.06) ** 2)
+                    if ring > best_g:
+                        best_g = ring
+                        best_h = int((d * 500 + t * 40 * sp) % 360)
+                h_val = best_h
+                s_val = 60
+                brightness = max(10, min(100, 12 + best_g * 88))
+
+            elif name == "spaceships":
+                s1_x, s1_y = 0.7 * math.sin(t * 3.0 * sp), 0.5 * math.cos(t * 2.0 * sp)
+                s2_x, s2_y = 0.6 * math.cos(t * 2.5 * sp + 1.5), 0.6 * math.sin(t * 3.2 * sp)
+                d1 = math.sqrt((x - s1_x) ** 2 + (y - s1_y) ** 2)
+                d2 = math.sqrt((x - s2_x) ** 2 + (y - s2_y) ** 2)
+                g1 = math.exp(-0.5 * (d1 / 0.15) ** 2)
+                g2 = math.exp(-0.5 * (d2 / 0.15) ** 2)
+                if g1 > g2:
+                    h_val, s_val = 0, 95
+                else:
+                    h_val, s_val = 210, 95
+                brightness = max(12, min(100, 12 + max(g1, g2) * 88))
+
+            elif name == "octopus":
+                tentacles = max(0.0, math.cos(angle * 8.0 - radius * 12.0 + t * 2.5 * sp)) ** 4
+                h_val = int((260 + 50 * radius) % 360)
+                s_val = 85
+                brightness = max(12, min(100, 15 + tentacles * 85))
+
+            elif name == "waving_cell":
+                wave = math.sin(zone * (6.0 / ww) * (2.0 * math.pi / NUM_SEGMENTS) - t * 3.0 * sp)
+                norm_w = (wave + 1.0) * 0.5
+                h_val = int((160 + norm_w * 70) % 360)
+                s_val = 85
+                brightness = max(15, min(100, 20 + norm_w * 80))
+
+            elif name == "plasma_ball":
+                fil = math.sin(angle * 11.0 + radius * 8.0 - t * 4.0 * sp)
+                fil_glow = max(0.0, fil) ** 5
+                h_val = int(280 + 40 * fil_glow) % 360
+                s_val = 85
+                brightness = max(12, min(100, 15 + fil_glow * 85))
+
+            elif name == "freqmatrix":
+                band = int((x + 1.0) * 2.5)
+                bar_h = 0.3 + 0.6 * math.sin(band * 1.5 + t * 4.0 * sp)
+                y_norm = (y + 1.0) * 0.5
+                diff = bar_h - y_norm
+                active = max(0.15, min(1.0, 0.15 + 0.85 * (diff / 0.15))) if diff > 0 else 0.15
+                h_val = int((band * 70) % 360)
+                s_val = 90
+                brightness = 15 + 65 * active
+
+            elif name == "freqwave":
+                wave = math.sin(radius * 10.0 - t * 3.5 * sp)
+                h_val = int((radius * 360.0 + t * 60.0 * sp) % 360)
+                s_val = 85
+                brightness = max(15, min(100, int(40 + 55 * ((wave + 1.0) * 0.5))))
+
+            elif name == "waterfall_audio":
+                stream = math.sin(y * (10.0 / ww) + t * 4.5 * sp + math.sin(x * 6.0))
+                norm_s = (stream + 1.0) * 0.5
+                h_val = int((190 + norm_s * 40) % 360)
+                s_val = 85
+                brightness = max(12, min(100, int(20 + norm_s * 80)))
+
+            elif name == "puddles":
+                p1_x, p1_y = -0.3, 0.2
+                p2_x, p2_y = 0.4, -0.1
+                d1 = math.sqrt((x - p1_x) ** 2 + (y - p1_y) ** 2)
+                d2 = math.sqrt((x - p2_x) ** 2 + (y - p2_y) ** 2)
+                r1 = (t * 1.2 * sp) % 1.2
+                r2 = (t * 1.2 * sp + 0.6) % 1.2
+                rip1 = math.exp(-0.5 * ((d1 - r1) / 0.08) ** 2) * max(0.0, 1.0 - r1 / 1.2)
+                rip2 = math.exp(-0.5 * ((d2 - r2) / 0.08) ** 2) * max(0.0, 1.0 - r2 / 1.2)
+                rip = max(rip1, rip2)
+                h_val = int((200 + rip * 40) % 360)
+                s_val = 85
+                brightness = max(10, min(100, 14 + rip * 86))
+
+            elif name == "gravcenter":
+                blast_r = (t * 1.8 * sp) % 1.4
+                diff = abs(radius - blast_r)
+                glow = math.exp(-0.5 * (diff / 0.12) ** 2) * max(0.0, 1.0 - blast_r / 1.4)
+                h_val = int((30 + radius * 120) % 360)
+                s_val = 95
+                brightness = max(10, min(100, 12 + glow * 88))
+
+            elif name == "waverly":
+                node = math.sin(x * 6.0 + t * 2.0 * sp) * math.cos(y * 6.0 - t * 2.0 * sp)
+                norm_n = (node + 1.0) * 0.5
+                h_val = int((240 + norm_n * 80) % 360)
+                s_val = 80
+                brightness = max(12, min(100, 15 + norm_n * 85))
+
+            elif name == "akemi":
+                head_y = 0.2 * math.sin(t * 3.0 * sp)
+                d_head = math.sqrt(x ** 2 + (y - head_y) ** 2)
+                is_head = max(0.0, min(1.0, (0.35 - d_head) / 0.08))
+                arm = math.sin(t * 3.0 * sp + math.pi) * 0.3
+                is_arm = max(0.0, min(1.0, (0.15 - abs(y - arm)) / 0.06)) * max(0.0, min(1.0, (abs(x) - 0.4) / 0.08))
+                if is_head > 0.01:
+                    h_val, s_val, brightness = 40, int(95 * is_head), int(20 + 60 * is_head)
+                elif is_arm > 0.01:
+                    h_val, s_val, brightness = 10, int(90 * is_arm), int(20 + 55 * is_arm)
+                else:
+                    h_val, s_val, brightness = 220, 80, 20
+
+            out.append([h_val, s_val, int(max(15, min(82, brightness)))])
+        return out
 
     def _render_lava_lamp(self, t: float) -> List[List[int]]:
         """
@@ -2020,8 +2645,8 @@ class L930EffectsEngine:
                 bg_c = sample_palette_oklab(pal, 0.0, cyclic=True)
                 h, sat = bg_c[0], bg_c[1]
 
-            # Dark glass between blobs; only cores approach full brightness.
-            bright = int(max(2, min(100, 2.0 + 98.0 * (norm_field ** 1.3))))
+            # Dark viscous glass between blobs (clamped to 2% floor for smoothness/test continuity); cores reach full brilliance
+            bright = int(max(2, min(100, 2.0 + 98.0 * (norm_field ** 1.35))))
             segs.append([h, sat, bright])
 
         return segs
@@ -2172,24 +2797,24 @@ class L930EffectsEngine:
             w2 = math.exp(-0.5 * (d2 / sigma2) ** 2)
             w3 = math.exp(-0.5 * (d3 / 2.2) ** 2) * 0.45
 
-            # Base ambient floor
-            r = 0.02
-            g = 0.02
-            b = 0.04
+            # Zero ambient floor for 100% OFF pure negatives
+            r = 0.0
+            g = 0.0
+            b = 0.0
 
             # Additive perceptual contribution from heads
             r += c1_rgb[0] * w1 + c2_rgb[0] * w2 + c3_rgb[0] * w3
             g += c1_rgb[1] * w1 + c2_rgb[1] * w2 + c3_rgb[1] * w3
             b += c1_rgb[2] * w1 + c2_rgb[2] * w2 + c3_rgb[2] * w3
 
-            # Soft, bounded collision bloom (not a single sampled flash).
+            # High-energy specular collision bloom with desaturated core
             flash_mult = max(0.2, min(1.6, getattr(self, "_flash_strength", 1.0)))
             if collision_factor > 0.0:
                 center_dist = abs(i - 24.5)
-                impact_bloom = collision_factor * math.exp(-0.5 * (center_dist / 3.0) ** 2) * flash_mult * 0.70
-                r += impact_bloom * 0.85
-                g += impact_bloom * 0.85
-                b += impact_bloom * 0.95
+                impact_bloom = collision_factor * math.exp(-0.5 * (center_dist / 3.0) ** 2) * flash_mult * 0.90
+                r += impact_bloom * 1.2
+                g += impact_bloom * 1.2
+                b += impact_bloom * 1.4
 
             # Clamp channels to [0.0, 1.0] and convert to Tapo HSV
             r_clamped = min(1.0, max(0.0, r))
@@ -2197,9 +2822,12 @@ class L930EffectsEngine:
             b_clamped = min(1.0, max(0.0, b))
             h, s, v = rgb_to_tapo_hsv(r_clamped, g_clamped, b_clamped)
 
-            # Boost brightness at heads
+            # Pure negatives: unreached ICs outside the collider heads and bloom are 100% OFF
             peak_w = max(w1, w2, w3, collision_factor)
-            v = int(max(10, min(100, 15.0 + peak_w * 85.0)))
+            if peak_w < 0.025:
+                v = 0
+            else:
+                v = int(min(100, peak_w * 100.0))
             segs.append([h, s, v])
 
         return segs
@@ -2250,8 +2878,8 @@ class L930EffectsEngine:
             prop_dub = math.exp(-0.5 * ((norm_dist - (phase - 0.18) * 1.4) / 0.32) ** 2) * dub_env
 
             pulse = (prop_lub * 1.1 + prop_dub * 0.85) * fs
-            base_b = 8
-            total_b = int(max(base_b, min(100, base_b + pulse * 82.0)))
+            base_b = 6
+            total_b = int(max(base_b, min(100, base_b + pulse * 88.0)))
 
             mix = prop_dub / (prop_lub + prop_dub + 1e-4)
             h = int((c_lub[0] * (1.0 - mix) + c_dub[0] * mix) % 360)
@@ -2361,7 +2989,11 @@ class L930EffectsEngine:
             tail_b = math.exp(-dist_b / decay_sigma)
             total = min(1.0, tail_a + tail_b)
             h, s, _ = sample_palette_oklab(pal, total)
-            b = int(max(6, min(100, 8 + total * 92)))
+            # Pure negatives: unreached zones stay strictly 100% OFF
+            if total < 0.025:
+                b = 0
+            else:
+                b = int(min(100, (total ** 1.15) * 100))
             segs.append([h, s, b])
         return segs
 
@@ -2375,12 +3007,14 @@ class L930EffectsEngine:
             self._tail_length = old_t
 
     def _render_harmonic_juggle(self, t: float) -> List[List[int]]:
-        """WLED Juggle-inspired pattern: eight colored dot heads with direction-aware, decaying trails."""
+        """WLED Juggle-inspired pattern: eight colored dot heads with direction-aware decaying trails and additive fusion."""
         from src.visual_styles import sample_palette_oklab
+        from src.pipeline import tapo_hsv_to_rgb, rgb_to_tapo_hsv
         pal = get_palette_hsv(self._palette_name if self._palette_name in PALETTES else "sunset")
         sp = max(0.2, self._speed)
-        values = [2.0] * NUM_SEGMENTS
-        frame = [[pal[0][0], pal[0][1], 2] for _ in range(NUM_SEGMENTS)]
+        r_acc = [0.0] * NUM_SEGMENTS
+        g_acc = [0.0] * NUM_SEGMENTS
+        b_acc = [0.0] * NUM_SEGMENTS
         dot_count = 8
         for dot in range(dot_count):
             angular_speed = 0.48 + dot * 0.115
@@ -2390,16 +3024,30 @@ class L930EffectsEngine:
             hue, sat, _ = sample_palette_oklab(
                 pal, (dot / dot_count + t * 0.025 * sp) % 1.0, cyclic=True
             )
+            dot_rgb = tapo_hsv_to_rgb(hue, sat, 100)
             for i in range(NUM_SEGMENTS):
                 distance = abs(i - position)
-                core = math.exp(-0.5 * (distance / 0.72) ** 2)
+                core = math.exp(-0.5 * (distance / 1.55) ** 2)
                 behind = (position - i) * direction
-                trail = math.exp(-max(0.0, behind) / 2.25) if 0 <= behind <= 8 else 0.0
+                trail = math.exp(-max(0.0, behind) / 3.0) if 0 <= behind <= 9 else 0.0
                 intensity = max(core, trail * 0.78)
-                value = 2.0 + 98.0 * intensity
-                if value > values[i]:
-                    values[i] = value
-                    frame[i] = [int(hue), int(sat), int(min(100, value))]
+                if intensity > 0.01:
+                    r_acc[i] += dot_rgb[0] * intensity
+                    g_acc[i] += dot_rgb[1] * intensity
+                    b_acc[i] += dot_rgb[2] * intensity
+
+        frame = []
+        for i in range(NUM_SEGMENTS):
+            tot = max(r_acc[i], g_acc[i], b_acc[i])
+            if tot < 0.02:
+                frame.append([0, 0, 0])
+            else:
+                r_c = min(1.0, r_acc[i])
+                g_c = min(1.0, g_acc[i])
+                b_c = min(1.0, b_acc[i])
+                h, s, v = rgb_to_tapo_hsv(r_c, g_c, b_c)
+                v = int(min(100, tot * 100.0))
+                frame.append([h, s, v])
         return frame
 
     @staticmethod
@@ -2473,8 +3121,8 @@ class L930EffectsEngine:
                 rocket_gain = 0.85 + 0.15 * math.sin(math.pi * age / ascent)
                 for i in range(NUM_SEGMENTS):
                     behind = (rocket_pos - i) * direction
-                    core = math.exp(-0.5 * ((i - rocket_pos) / 0.72) ** 2)
-                    tail = math.exp(-max(0.0, behind) / 2.0) if 0 <= behind <= 7 else 0.0
+                    core = math.exp(-0.5 * ((i - rocket_pos) / 1.55) ** 2)
+                    tail = math.exp(-max(0.0, behind) / 2.6) if 0 <= behind <= 8 else 0.0
                     val = 2.0 + 96.0 * rocket_gain * max(core, tail * 0.72)
                     if val > values[i]:
                         values[i] = val
@@ -2494,11 +3142,11 @@ class L930EffectsEngine:
                 spark_h, spark_s, _ = sample_palette_oklab(
                     pal, (rng.random() * 0.72 + burst_age * 0.18) % 1.0, cyclic=True
                 )
-                for i in range(max(0, int(spark_pos - 5)), min(NUM_SEGMENTS, int(spark_pos + 6))):
+                for i in range(max(0, int(spark_pos - 6)), min(NUM_SEGMENTS, int(spark_pos + 7))):
                     dist = abs(i - spark_pos)
-                    core = math.exp(-0.5 * (dist / 0.78) ** 2)
+                    core = math.exp(-0.5 * (dist / 1.50) ** 2)
                     behind = (spark_pos - i) * spark_dir
-                    tail = math.exp(-max(0.0, behind) / 2.4) if 0 <= behind <= 5 else 0.0
+                    tail = math.exp(-max(0.0, behind) / 3.0) if 0 <= behind <= 6 else 0.0
                     val = 2.0 + 98.0 * decay * max(core, tail * 0.76)
                     if val > values[i]:
                         values[i] = val
@@ -2591,10 +3239,10 @@ class L930EffectsEngine:
             )
             for i in range(NUM_SEGMENTS):
                 dist = abs(i - position)
-                core = math.exp(-0.5 * (dist / 0.88) ** 2)
+                core = math.exp(-0.5 * (dist / 1.55) ** 2)
                 behind = (position - i) * direction
-                tail = math.exp(-max(0.0, behind) / 2.0) if 0 <= behind <= 4 else 0.0
-                value = 2.0 + 98.0 * max(core, tail * 0.38)
+                tail = math.exp(-max(0.0, behind) / 2.8) if 0 <= behind <= 6 else 0.0
+                value = 2.0 + 98.0 * max(core, tail * 0.45)
                 if value > values[i]:
                     values[i] = value
                     frame[i] = [int(hue), int(sat), int(min(100, value))]
@@ -2658,6 +3306,7 @@ class L930EffectsEngine:
         event_period = 0.72 / max(0.45, sp)
         active_event = max(0, int(t / event_period))
 
+        coords = get_l930_topology().coords
         for zone, (x, y) in enumerate(coords):
             xn = (x + 1.0) * 0.5
             yn = max(0.0, min(1.0, (y + 1.0) / 1.8))
@@ -2671,8 +3320,8 @@ class L930EffectsEngine:
                 dx, dy = x - cx, y - cy
                 r = math.sqrt(dx * dx + dy * dy)
                 phi = math.atan2(dy, dx)
-                orbit_dots = max(0.0, math.cos(phi * 7.0 - t * 2.7 * sp)) ** 12
-                ring = math.exp(-0.5 * ((r - (0.45 + 0.05 * math.sin(t * sp))) / 0.08) ** 2)
+                orbit_dots = max(0.0, math.cos(phi * (3.0 + 4.0 * density) - t * 2.7 * sp)) ** max(4, int(round(12 / density)))
+                ring = math.exp(-0.5 * ((r - (0.45 + 0.05 * math.sin(t * sp))) / (0.08 * math.sqrt(density))) ** 2)
                 brightness = 2 + 96 * max(orbit_dots * math.exp(-abs(r - 0.48) * 4.0), ring * 0.75)
                 if r < 0.18:
                     brightness = 2
@@ -2693,10 +3342,10 @@ class L930EffectsEngine:
 
             elif effect == "ps_waterfall":
                 phase = (yn * 2.45 + t * 0.62 * sp + 0.13 * math.sin(x * 8.0)) % 1.0
-                streak = math.exp(-0.5 * ((phase - 0.82) / (0.045 * width)) ** 2)
-                tail = math.exp(-max(0.0, 0.82 - phase) / (0.16 * width)) if phase < 0.82 else 0.0
+                streak = math.exp(-0.5 * ((phase - 0.82) / (0.15 * width)) ** 2)
+                tail = math.exp(-max(0.0, 0.82 - phase) / (0.40 * width)) if phase < 0.82 else 0.0
                 lateral = 0.52 + 0.48 * math.sin(x * 15.0 + t * 1.5 * sp)
-                brightness = 2 + 96 * max(streak, tail * 0.58) * lateral
+                brightness = 10 + 65 * max(streak, tail * 0.58) * lateral
                 hue_pos = (0.52 + 0.35 * yn + t * 0.02 * sp) % 1.0
 
             elif effect == "ps_vortex":
@@ -2736,9 +3385,9 @@ class L930EffectsEngine:
             elif effect == "ps_volcano":
                 source_x = 0.08 * math.sin(t * 0.55 * sp)
                 dx = x - source_x
-                plume = math.exp(-0.5 * (dx / (0.11 + yn * 0.22)) ** 2)
+                plume = math.exp(-0.5 * (dx / ((0.11 + yn * 0.22) * math.sqrt(density))) ** 2)
                 rising = 0.5 + 0.5 * math.sin(yn * 23.0 - t * 4.0 * sp + math.sin(x * 11))
-                heat = max(0.0, (1.0 - yn) * 0.72 + plume * rising * 0.63)
+                heat = max(0.0, (1.0 - yn) * 0.72 + plume * rising * (0.40 + 0.25 * density))
                 brightness = 2 + 98 * min(1.0, heat) ** 1.5
                 hue_pos = min(1.0, heat)
 
@@ -2799,11 +3448,11 @@ class L930EffectsEngine:
                     ax, ay = xy_attractor(k, t)
                     dist = math.sqrt((x - ax) ** 2 + (y - ay) ** 2)
                     orbit = abs(math.sin(angle * 2.0 - radius * 10.0 + t * sp * (0.8 + k * 0.06)))
-                    glow = math.exp(-0.5 * (dist / 0.09) ** 2) + 0.22 * orbit * math.exp(-radius * 1.3)
+                    glow = math.exp(-0.5 * (dist / 0.16) ** 2) + 0.22 * orbit * math.exp(-radius * 1.3)
                     if glow > best:
                         best = glow
                         best_hue = (k / 8.0 + t * 0.02 * sp) % 1.0
-                brightness = 2 + 96 * min(1.0, best)
+                brightness = 10 + 68 * min(1.0, best)
                 hue_pos = best_hue
 
             elif effect == "ps_spray":
@@ -2844,15 +3493,17 @@ class L930EffectsEngine:
                 hx = 0.66 * math.sin(phase)
                 hy = 0.57 * math.sin(phase * 1.37 + 0.7)
                 dist = math.sqrt((x - hx) ** 2 + (y - hy) ** 2)
-                head = math.exp(-0.5 * (dist / 0.065) ** 2)
+                head = math.exp(-0.5 * (dist / 0.18) ** 2)
                 trail = 0.0
-                for tail_step in range(1, max(2, min(14, int(round(8 * self._tail_length))))):
-                    past_t = max(0.0, t - tail_step * 0.055 / max(0.2, sp))
+                tl_steps = max(2, min(16, int(round(10 * self._tail_length))))
+                tl_decay = 2.0 * max(0.3, self._tail_length)
+                for tail_step in range(1, tl_steps):
+                    past_t = max(0.0, t - tail_step * 0.065 / max(0.2, sp))
                     tx = 0.66 * math.sin(past_t * 0.45 * sp)
                     ty = 0.57 * math.sin(past_t * 0.45 * sp * 1.37 + 0.7)
                     td = math.sqrt((x - tx) ** 2 + (y - ty) ** 2)
-                    trail = max(trail, math.exp(-0.5 * (td / 0.055) ** 2) * math.exp(-tail_step / 5.0))
-                brightness = 2 + 98 * max(head, trail * 0.75)
+                    trail = max(trail, math.exp(-0.5 * (td / 0.18) ** 2) * math.exp(-tail_step / tl_decay))
+                brightness = 2 + 98 * max(head, trail * 0.85)
                 hue_pos = (phase * 0.11 + radius * 0.15) % 1.0
 
             elif effect == "ps_blobs":
@@ -2891,25 +3542,28 @@ class L930EffectsEngine:
 
         norm_t = (t * 0.05 * sp) % 1.0
         beacon_h, beacon_s, _ = sample_palette_oklab(pal, norm_t, cyclic=True)
+        tail_h, tail_s, _ = sample_palette_oklab(pal, (norm_t + 0.25) % 1.0, cyclic=True)
 
         segs = []
         tl = max(0.2, min(3.0, getattr(self, "_tail_length", 1.0)))
         for i in range(NUM_SEGMENTS):
             dist = abs(i - pos)
-            head_glow = math.exp(-0.5 * (dist / 3.0) ** 2)
+            head_glow = math.exp(-0.5 * (dist / 2.8) ** 2)
             trailing_offset = (pos - i) if vel > 0 else (i - pos)
             if trailing_offset > 0:
-                trail_glow = math.exp(-trailing_offset / (7.0 * tl)) * 0.65
+                trail_glow = math.exp(-trailing_offset / (6.8 * tl)) * 0.70
             else:
                 trail_glow = 0.0
 
             intensity = min(1.0, head_glow + trail_glow)
-            v = int(max(8, min(100, 8 + intensity * 92.0)))
-            if head_glow < 0.4 and intensity > 0.08:
-                tail_h, tail_s, _ = sample_palette_oklab(pal, (norm_t + 0.25) % 1.0, cyclic=True)
-                segs.append([tail_h, tail_s, v])
-            else:
-                segs.append([beacon_h, beacon_s, v])
+            v = int(max(6, min(100, 6 + intensity * 94.0)))
+
+            # Continuous sub-zone color interpolation between beacon head and tail
+            head_weight = max(0.0, min(1.0, head_glow * 1.6))
+            diff_h = ((beacon_h - tail_h + 180) % 360) - 180
+            final_h = int(round((tail_h + head_weight * diff_h) % 360))
+            final_s = int(round(tail_s + head_weight * (beacon_s - tail_s)))
+            segs.append([final_h, final_s, v])
 
         return segs
 
@@ -2938,10 +3592,10 @@ class L930EffectsEngine:
         frame = []
         for i in range(NUM_SEGMENTS):
             behind = head - i
-            if -1.5 <= behind <= 2.0:
-                glow = math.exp(-0.5 * (behind / 0.85) ** 2)
-                tail_pos = 0.0
-            elif 2.0 < behind <= tail_length:
+            if -2.5 <= behind <= 3.0:
+                glow = math.exp(-0.5 * (behind / 1.55) ** 2)
+                tail_pos = max(0.0, behind / tail_length) if behind > 0 else 0.0
+            elif 3.0 < behind <= tail_length:
                 glow = math.exp(-behind / max(2.0, tail_length * 0.42)) * decay[i]
                 tail_pos = behind / tail_length
             else:
@@ -2950,7 +3604,12 @@ class L930EffectsEngine:
             hue, sat, _ = sample_palette_oklab(pal, min(1.0, 0.08 + tail_pos * 0.92), cyclic=False)
             white_mix = max(0.0, 1.0 - tail_pos * 3.0) * glow
             hue = int((hue * (1.0 - white_mix) + 195 * white_mix) % 360)
-            value = int(max(2, min(100, 2 + 98 * glow)))
+            sat = int(sat * (1.0 - 0.70 * white_mix))
+            # Pure negative space (100% OFF) outside meteor head and tail
+            if glow < 0.01:
+                value = 0
+            else:
+                value = int(min(100, glow * 100.0))
             frame.append([hue, int(sat), value])
         return frame
 
@@ -2961,8 +3620,8 @@ class L930EffectsEngine:
         wave_width = max(0.4, min(2.5, getattr(self, "_wave_width", 1.0)))
         pal = get_palette_hsv(self._palette_name if self._palette_name in PALETTES else "tide")
         spawn_period = 0.56 / max(0.55, sp)
-        values = [2.0] * NUM_SEGMENTS
-        frame = [[200, 90, 2] for _ in range(NUM_SEGMENTS)]
+        values = [0.0] * NUM_SEGMENTS
+        frame = [[200, 90, 0] for _ in range(NUM_SEGMENTS)]
         start = max(0, int((t - 2.4 / max(0.65, sp)) / spawn_period))
         end = max(0, int(t / spawn_period) + 1)
         for event in range(start, end + 1):
@@ -2979,10 +3638,12 @@ class L930EffectsEngine:
             for i in range(NUM_SEGMENTS):
                 ring_dist = abs(abs(i - center) - radius)
                 crest = math.exp(-0.5 * (ring_dist / width) ** 2)
-                val = 2.0 + 98.0 * envelope * crest
-                if val > values[i]:
-                    values[i] = val
-                    frame[i] = [int(hue), int(sat), int(min(100, val))]
+                raw_crest = envelope * crest
+                if raw_crest > 0.015:
+                    val = 100.0 * raw_crest
+                    if val > values[i]:
+                        values[i] = val
+                        frame[i] = [int(hue), int(sat), int(min(100, val))]
         return frame
 
     def _render_spiral_vortex(self, t: float) -> List[List[int]]:
@@ -3005,9 +3666,12 @@ class L930EffectsEngine:
             wave = 0.5 + 0.5 * math.cos(spiral_phase * 2.0 * math.pi)
 
             h, s, _ = sample_palette_oklab(pal, (norm_r * 0.6 + rot_phase * 0.4) % 1.0, cyclic=True)
-            # Narrower bright bands separated by near-black troughs.
-            core_intensity = wave ** 2.4
-            v = int(max(2, min(100, 2 + core_intensity * 98 * (1.0 - 0.30 * norm_r))))
+            # Pure negative space (100% OFF) in troughs between spiral arms
+            core_intensity = wave ** 2.8
+            if core_intensity < 0.03:
+                v = 0
+            else:
+                v = int(min(100, core_intensity * 100.0 * (1.0 - 0.25 * norm_r)))
             segs.append([h, s, v])
         return segs
 
@@ -3163,8 +3827,12 @@ class L930EffectsEngine:
             norm_pos = (i / float(NUM_SEGMENTS - 1) - scan) % 1.0
             wave = 0.5 + 0.5 * math.sin(norm_pos * 3.0 * 2.0 * math.pi)
             h, s, _ = sample_palette_oklab(neon_pal, norm_pos, cyclic=True)
-            # Punchy neon rails with dark negative space between them.
-            v = int(max(2, min(100, 2 + (wave ** 2.8) * 98)))
+            # Punchy neon rails with 100% OFF pure negative space between them
+            core = wave ** 2.8
+            if core < 0.025:
+                v = 0
+            else:
+                v = int(min(100, core * 100.0))
             segs.append([h, s, v])
         return segs
 
@@ -3189,8 +3857,11 @@ class L930EffectsEngine:
 
             h = int(28 + (1.0 - core) * 14)
             s = int(82 + core * 18)
-            # Keep the warm moving lantern distinct from a full-strip wash.
-            v = int(max(2, min(100, 2 + intensity * 98)))
+            # Pure negative space between sweeps; warm lantern core reaches full brilliance
+            if intensity < 0.025:
+                v = 0
+            else:
+                v = int(min(100, intensity * 100))
             segs.append([h, s, v])
         return segs
 
@@ -3472,7 +4143,6 @@ class L930EffectsEngine:
         pal = get_palette_hsv(self._palette_name if self._palette_name in PALETTES else "sunset")
         sp = max(0.2, self._speed)
         interval = self._effective_render_interval()
-        topo = get_l930_topology()
 
         t_a = t / max(13.0 / sp, 22.0 * interval)
         t_b = t / max(19.0 / sp, 30.0 * interval)
@@ -3481,11 +4151,17 @@ class L930EffectsEngine:
 
         segs = []
         for i in range(NUM_SEGMENTS):
-            x, y = topo.coords[i]
+            continuous_angle = (i / float(NUM_SEGMENTS)) * 2.0 * math.pi
+            x = math.cos(continuous_angle)
+            y = math.sin(continuous_angle) * 0.75
             d = math.sqrt((x - px) ** 2 + (y - py) ** 2)
             glow = math.exp(-0.5 * (d / 0.95) ** 2)
             h, s, _ = sample_palette_oklab(pal, (d * 0.4 + t * 0.04 * sp) % 1.0, cyclic=True)
-            v = int(max(12, min(100, 12 + glow * 88)))
+            # Pure negative space in empty space; celestial body glows up to 100%
+            if glow < 0.025:
+                v = 0
+            else:
+                v = int(min(100, (glow ** 1.1) * 100.0))
             segs.append([h, s, v])
         return segs
 
@@ -3498,8 +4174,9 @@ class L930EffectsEngine:
         pal = get_palette_hsv(self._palette_name if self._palette_name in PALETTES else "forest")
         sp = max(0.2, self._speed)
         interval = self._effective_render_interval()
-        topo = get_l930_topology()
-        proj = topo.directional_projection(angle_deg=45.0)
+        # Smooth continuous linear projection across the physical strip (0.0 to 1.0)
+        # Guarantees breeze sweeps smoothly across every individual IC without jumping in 13-zone blocks
+        proj = np.linspace(0.0, 1.0, NUM_SEGMENTS, dtype=np.float32)
 
         period = max(13.0 / sp, 22.0 * interval)
         phase = (t / period) % 1.0
@@ -3526,8 +4203,8 @@ class L930EffectsEngine:
         pal = get_palette_hsv(self._palette_name if self._palette_name in PALETTES else "forest")
         interval = self._effective_render_interval()
         tail_mult = max(0.2, getattr(self, "_tail_length", 1.0))
-        topo = get_l930_topology()
-        angles = topo.polar_projection(center_x=0.0, center_y=0.0)
+        # Smooth continuous polar angle across all 50 ICs (0.0 to 1.0)
+        angles = np.linspace(0.0, 1.0, NUM_SEGMENTS, dtype=np.float32)
 
         period = max(8.5 / sp, 15.0 * interval)
         beam_angle = (t / period) % 1.0
@@ -3544,9 +4221,13 @@ class L930EffectsEngine:
                 decay = math.exp(-diff / decay_rate)
                 h = head_h
                 s = int(max(30, 95 - decay * 55))
-                v = int(max(8, min(100, 8 + decay * 92)))
+                # Pure negative space (100% OFF) once the phosphor has decayed
+                if decay < 0.02:
+                    v = 0
+                else:
+                    v = int(min(100, decay * 100.0))
             else:
-                h, s, v = head_h, 85, 8
+                h, s, v = head_h, 85, 0
             segs.append([h, s, v])
         return segs
 
@@ -3760,7 +4441,11 @@ class L930EffectsEngine:
                 core = max(core, math.exp(-0.5 * (d / (width * 0.30)) ** 2) * pulse)
             heat = min(1.0, heat)
             h, sat, _ = sample_palette_oklab(pal, min(1.0, heat * 0.82 + core * 0.18), cyclic=False)
-            value = int(max(2, min(100, 3 + heat * 66 + core ** 2 * 31)))
+            # Pure negative space (100% OFF) in cold coal bed outside glowing ember pockets
+            if heat < 0.045:
+                value = 0
+            else:
+                value = int(min(100, heat * 70.0 + core ** 2 * 30.0))
             segs.append([h, sat, value])
         return segs
 
@@ -3781,7 +4466,11 @@ class L930EffectsEngine:
             field = min(1.0, line_a * 0.55 + line_b * 0.36 + node * 0.75)
             phase = (0.12 + 0.42 * line_a + 0.28 * line_b + 0.18 * node + t * 0.035 * sp) % 1.0
             h, sat, _ = sample_palette_oklab(pal, phase, cyclic=True)
-            value = int(max(2, min(100, 3 + field * 65 + node * 32)))
+            # Pure negative space (100% OFF) between neon circuit paths
+            if field < 0.03 and node < 0.05:
+                value = 0
+            else:
+                value = int(min(100, field * 70.0 + node * 30.0))
             segs.append([h, sat, value])
         return segs
 
@@ -3858,7 +4547,32 @@ class L930EffectsEngine:
     def _compute_raw(self, name: str, t: float = 0.0) -> List[List[int]]:
         eff = resolve_effect_alias(name)
 
-        if eff in WLED_2D_EFFECTS:
+        wled_1d_ext_set = {
+            "android", "blink", "blink_rainbow", "colorloop", "colorwaves",
+            "chase_rainbow", "chase_flash", "chase_random", "colorful", "dynamic",
+            "dynamic_smooth", "fade", "glitter", "loading", "percent",
+            "plasma_1d", "popcorn", "pride_2015", "running", "saw",
+            "scan", "scanner_dual", "sparkle", "theater_rainbow", "wipe"
+        }
+        if eff in wled_1d_ext_set:
+            return self._render_wled_1d_ext(eff, t)
+
+        wled_2d_ext_set = {
+            "matrix_rain", "metaballs_2d", "game_of_life", "tartan", "polar_lights",
+            "drift_rose", "crazy_bees", "colored_bursts", "swirl", "sindots",
+            "dna", "tv_simulator", "sun_radiation", "soap_bubbles", "spaceships",
+            "octopus", "waving_cell", "plasma_ball", "freqmatrix", "freqwave",
+            "waterfall_audio", "puddles", "gravcenter", "waverly", "akemi"
+        }
+        if eff in wled_2d_ext_set:
+            return self._render_wled_2d_ext(eff, t)
+
+        wled_particle_set = {
+            'black_hole', 'ps_fire', 'ps_waterfall', 'ps_vortex', 'ps_fireworks',
+            'ps_volcano', 'ps_ballpit', 'ps_box', 'ps_fuzzy_noise', 'ps_impact',
+            'ps_attractor', 'ps_spray', 'ps_geq_nova', 'ps_ghost_rider', 'ps_blobs'
+        }
+        if eff in wled_particle_set or eff.startswith('ps_'):
             return self._render_wled_2d(eff, t)
         if eff == "lava_lamp":
             return self._render_lava_lamp(t)

@@ -13,7 +13,7 @@ from src.music_reactive import get_audio_input_source
 from src.audio_dsp import SpectralFluxOnsetDetector, BPMTracker, DynamicAudioCalibrator, MusicAnalyzer, MusicState, Section
 from src.visual_styles import get_visual_style, STYLE_REGISTRY, create_style_instances, AccentCompositor, DirectorStyle, sample_palette_oklab
 from src.frame_bus import FramePacket, OutputProducer
-from src.music_dynamics import MusicBrightnessFloor, music_is_genuinely_active, fade_segments, silence_fade_duration, effective_send_rate
+from src.music_dynamics import MusicBrightnessFloor, music_is_genuinely_active, fade_segments, silence_fade_duration, effective_send_rate, ZoneTemporalSmoother
 
 NUM_SEGMENTS = 50
 
@@ -87,10 +87,11 @@ class MusicReactiveL930:
         self._analyzer = MusicAnalyzer(samplerate=self._sr, blocksize=self._bs, sensitivity=1.0)
         self._styles = create_style_instances()
         self._compositor = AccentCompositor()
-        # Default to the tempo/phase-locked visualizer. Chain Reaction is intentionally
-        # stochastic, so making it the default looks like random flashing rather than beat sync.
-        self.style_name = "bpm_resonator"
-        self._visual_mode = "bpm_resonator"
+        # Default to the 50-band Equalizer Spectrum visualizer.
+        # Direct IC frequency mapping provides immediate transient/kick/note reactivity
+        # and strictly turns off when silent without glowing autonomously.
+        self.style_name = "spectrum"
+        self._visual_mode = "spectrum"
         self.latest_music_state: MusicState | None = None
         self._coordinator: Any = None
 
@@ -99,6 +100,7 @@ class MusicReactiveL930:
         self._silence_duration = 0.0
         self._powered_down_for_silence = False
         self._brightness_floor = MusicBrightnessFloor()
+        self._smoother = ZoneTemporalSmoother(num_zones=NUM_SEGMENTS, attack_tau=0.0, decay_tau=0.040)
         self._last_active_segs: Optional[list[list[int]]] = None
         self._latency_lookahead_ms = 0.0  # Kept at 0 by default; true lockstep achieved via measured output delay
 
@@ -133,7 +135,7 @@ class MusicReactiveL930:
         self._eq_weights[:10] *= 0.90  # prevent sub-bass clip
 
         # Keep profile and visual-style state consistent at startup.
-        self._visual_mode = "bpm_resonator"
+        self._visual_mode = "spectrum"
         self._single_hue = 185  # Clean electric cyan default for single-color mode
 
         # Dynamic state trackers
@@ -201,11 +203,15 @@ class MusicReactiveL930:
         if isinstance(director, DirectorStyle):
             director.compositor.set_accent_enabled(name, enabled)
 
-    def set_style_params(self, speed: float | None = None, intensity: float | None = None, smoothing: float | None = None, palette_mode: str | None = None):
+    def set_style_params(self, speed: float | None = None, intensity: float | None = None, smoothing: float | None = None, palette_mode: str | None = None, brightness_cap: float | None = None):
+        if brightness_cap is not None and isinstance(self._app_state, dict):
+            self._app_state["brightness"] = max(1, min(100, int(brightness_cap)))
         for s in self._styles.values():
-            s.set_params(speed=speed, intensity=intensity, smoothing=smoothing, palette_mode=palette_mode)
+            s.set_params(speed=speed, intensity=intensity, smoothing=smoothing, palette_mode=palette_mode, brightness_cap=brightness_cap)
 
     def get_analyzer(self) -> MusicAnalyzer:
+        if self._coordinator and hasattr(self._coordinator, "analyzer"):
+            return self._coordinator.analyzer
         return self._analyzer
 
     def set_coordinator(self, coordinator: Any):
@@ -356,6 +362,8 @@ class MusicReactiveL930:
 
         if hasattr(self._ctrl, "clear_frames"):
             self._ctrl.clear_frames()
+        if hasattr(self, "_smoother"):
+            self._smoother.reset()
         self._target_segs = [[0, 0, 0] for _ in range(NUM_SEGMENTS)]
         self._rendered_segs = [[0, 0, 0] for _ in range(NUM_SEGMENTS)]
         dark = {"segments": [[0, 0, 0] for _ in range(NUM_SEGMENTS)],
@@ -405,9 +413,14 @@ class MusicReactiveL930:
                 self._report_audio_error(message)
                 break
 
-            elapsed = time.perf_counter() - t0
-            sleep_time = max(0.001, target_dt - elapsed)
-            stop_event.wait(sleep_time)
+            if self._coordinator and hasattr(self._coordinator, "new_frame_event"):
+                # Zero-latency event-driven wakeup: fires the sub-millisecond audio analysis finishes
+                self._coordinator.new_frame_event.wait(timeout=target_dt)
+                self._coordinator.new_frame_event.clear()
+            else:
+                elapsed = time.perf_counter() - t0
+                sleep_time = max(0.001, target_dt - elapsed)
+                stop_event.wait(sleep_time)
 
     def _render_from_music_state(self, st: MusicState, dt: float, timing: Optional[Dict[str, float]] = None):
         master_ceiling = self._app_state.get("brightness", 100) / 100.0
@@ -444,7 +457,7 @@ class MusicReactiveL930:
                         float(getattr(sender, "_aimd_rate_cap", configured_ups)),
                     ))
                 transition = min(6000, max(
-                    int(getattr(self._ctrl, "music_transition_ms", 120)),
+                    int(getattr(self._ctrl, "music_transition_ms", 0)),
                     int(round(980.0 / active_ups)),
                 ))
                 self._publish_frame({
@@ -456,28 +469,47 @@ class MusicReactiveL930:
 
                 if self._silence_duration >= 3.0 and not self._powered_down_for_silence:
                     self._powered_down_for_silence = True
+                    if hasattr(self, "_smoother"):
+                        self._smoother.reset()
                     if hasattr(self._ctrl, "turn_off"):
                         if self._loop_runner and getattr(self._loop_runner, "loop", None):
                             asyncio.run_coroutine_threadsafe(self._ctrl.turn_off(), self._loop_runner.loop)
                         else:
                             try:
-                                asyncio.get_running_loop().create_task(self._ctrl.turn_off())
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(self._ctrl.turn_off())
                             except RuntimeError:
-                                pass
+                                res = self._ctrl.turn_off()
+                                if asyncio.iscoroutine(res):
+                                    try:
+                                        asyncio.create_task(res)
+                                    except Exception:
+                                        pass
             return
 
         self._silence_count = 0
         self._silence_duration = 0.0
         if self._powered_down_for_silence:
+            t_resume_start = time.perf_counter()
             self._powered_down_for_silence = False
+            if hasattr(self._ctrl, "_is_on"):
+                self._ctrl._is_on = True
             if hasattr(self._ctrl, "turn_on"):
                 if self._loop_runner and getattr(self._loop_runner, "loop", None):
                     asyncio.run_coroutine_threadsafe(self._ctrl.turn_on(), self._loop_runner.loop)
                 else:
                     try:
-                        asyncio.get_running_loop().create_task(self._ctrl.turn_on())
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self._ctrl.turn_on())
                     except RuntimeError:
-                        pass
+                        res = self._ctrl.turn_on()
+                        if asyncio.iscoroutine(res):
+                            try:
+                                asyncio.create_task(res)
+                            except Exception:
+                                pass
+            if hasattr(self._ctrl, "diagnostics"):
+                self._ctrl.diagnostics.record_resume_latency((time.perf_counter() - t_resume_start) * 1000.0)
 
         style_key = self.style_name
         # Check direct match in style registry first so dedicated vibe styles are never clobbered
@@ -495,7 +527,9 @@ class MusicReactiveL930:
             style = self._styles.get("pulse")
         else:
             style = self._styles.get(style_key, self._styles.get("pulse", self._styles.get("auto")))
-        measured_lat = getattr(getattr(self._ctrl, "diagnostics", None), "total_latency_ms", 0.0) / 1000.0
+        diag = getattr(self._ctrl, "diagnostics", None)
+        rtt_lat = (getattr(diag, "total_latency_ms", 0.0) or 0.0) / 1000.0 if diag else 0.0
+        measured_lat = max(0.030, rtt_lat)
         output_rate = effective_send_rate(self._ctrl, fallback_rate=8.0)
         style.set_params(measured_latency_s=measured_lat, output_interval_s=1.0 / output_rate)
 
@@ -515,7 +549,7 @@ class MusicReactiveL930:
         self.estimated_bpm = getattr(st, "bpm", 120.0)
         self.confidence = getattr(st, "bpm_confidence", 0.0)
 
-        if st.section == Section.DROP and st.drop_strength > 0.82 and st.impact > 0.80:
+        if st.section == Section.DROP and getattr(st, "impact", 0.0) > 0.85:
             self._white_punch = 100.0
             self._beat_punch = 65.0
         else:
@@ -524,14 +558,21 @@ class MusicReactiveL930:
 
         corrected_segs = self._pipeline.correct_hsv_sequence(segs, master_ceiling=master_ceiling)
         corrected_segs = self._brightness_floor.apply_l930(corrected_segs, floor_value)
-        self._last_active_segs = [list(zone) for zone in corrected_segs]
-        self._target_segs = corrected_segs
-        self._rendered_segs = corrected_segs
-        brightness_val = int(max(x[2] for x in corrected_segs)) if corrected_segs else 0
 
-        # Keep hardware transitions matched to the *effective* send interval.
-        # When AIMD drops a slow strip to 1 FPS, a fixed 120ms music transition
-        # creates a dark/stale gap for ~880ms and looks like flicker.
+        strobe_flag = bool(getattr(st, "white_strobe", False))
+        smoothed_segs = self._smoother.process(
+            corrected_segs,
+            dt=dt,
+            white_punch=self._white_punch,
+            strobe=strobe_flag,
+        )
+        self._last_active_segs = [list(zone) for zone in smoothed_segs]
+        self._target_segs = smoothed_segs
+        self._rendered_segs = smoothed_segs
+        brightness_val = int(max(x[2] for x in smoothed_segs)) if smoothed_segs else 0
+
+        # Keep hardware transitions matched to the *effective* send interval for Movie ambilight.
+        # For music reactivity, transition is 0 by default for instant beat snap without hardware lag.
         is_movie = (style_key == "movie")
         target_max_ups = getattr(self._ctrl, "_movie_max_updates_per_s", 2.0) if is_movie else getattr(self._ctrl, "_max_updates_per_s", 8.0)
         target_max_ups = max(0.5, float(target_max_ups))
@@ -551,13 +592,14 @@ class MusicReactiveL930:
             getattr(self._ctrl, "movie_transition_ms", 800)
             if is_movie else getattr(self._ctrl, "music_transition_ms", 120)
         )
-        # 98% of the send period prevents the device from snapping back to a
-        # previous/stale state between updates. Clamp to the firmware's 6000ms max.
-        rate_matched_transition = int(round(980.0 / effective_ups))
-        trans_ms = max(0, min(6000, max(int(configured_transition), rate_matched_transition)))
+        if int(configured_transition) == 0:
+            trans_ms = 0
+        else:
+            rate_matched_transition = int(round(980.0 / effective_ups))
+            trans_ms = max(0, min(6000, max(int(configured_transition), rate_matched_transition)))
 
         frame_dict = {
-            "segments": corrected_segs,
+            "segments": smoothed_segs,
             "brightness": brightness_val,
             "transition": trans_ms,
             "_pre_corrected": True,
@@ -668,7 +710,7 @@ class MusicReactiveL930:
                     float(getattr(sender, "_aimd_rate_cap", configured_ups)),
                 ))
             transition = min(6000, max(
-                int(getattr(self._ctrl, "music_transition_ms", 120)),
+                int(getattr(self._ctrl, "music_transition_ms", 0)),
                 int(round(980.0 / effective_ups)),
             ))
             self._publish_frame({

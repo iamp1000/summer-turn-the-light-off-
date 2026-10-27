@@ -327,8 +327,7 @@ def test_dedicated_single_zone_l900_rendering():
     )
     screen = ScreenData(global_hsv=(200, 60, 70), column_hsvs=[(200, 60, 70)] * 50)
 
-    for mode_name in ["movie", "pulse", "spectrum", "flow"]:
-        style = styles[mode_name]
+    for mode_name, style in styles.items():
         frame_1 = style.render(state, dt=0.03, num_zones=1, screen_data=screen)
         assert len(frame_1) == 1, f"{mode_name} did not return 1 zone for L900"
         h, s, v = frame_1[0]
@@ -674,4 +673,101 @@ def test_reactive_aurora_style():
 
     assert max(v_values) > min(v_values) + 20, "Transient must create distinct peak highlights"
     assert min(v_values) < 50, "Quiet/valley zones must not flash when transients hit"
+
+
+# ── 16. Comprehensive L900 Single-Zone Calibration & Distinctiveness ──────────
+
+def test_all_l900_styles_distinct_and_calibrated():
+    """
+    Verifies that every visual style exhibits purposeful, non-identical,
+    and musically calibrated behavior on single-zone L900 strips:
+      - NeonDrive distinguishes kick (Cyan 185) vs snare (Magenta 315).
+      - SubBlast triggers wide-spectrum hue advancement on successive ripples and white strobe on extreme bass.
+      - VocalGlow isolates vocal/mid band and ignores pure kick transients.
+      - BpmResonator gives strong downbeat accents on bar 0 vs offbeats.
+      - AcousticString exhibits sharp pluck desaturation shimmer.
+      - HydroAcoustic produces turquoise surge on kicks and seafoam on hats.
+      - LofiVinyl maintains warm vintage amber/gold glow without sharp flashes.
+      - MelodicContour tracks melodic pitch centroid across palette.
+    """
+    import numpy as np
+    from src.visual_styles import (
+        NeonDriveStyle, SubBlastStyle, VocalGlowStyle,
+        BpmResonatorStyle, AcousticStringStyle, HydroAcousticStyle,
+        LofiVinylStyle, MelodicContourStyle, TwinkleStyle,
+    )
+
+    # 1. NeonDrive: Kick -> Cyan (185), Snare -> Magenta (315)
+    neon = NeonDriveStyle()
+    f_kick = neon.render(MusicState(energy=0.5, kick=0.9, snare=0.0), dt=0.03, num_zones=1)
+    f_snare = neon.render(MusicState(energy=0.5, kick=0.0, snare=0.9), dt=0.03, num_zones=1)
+    assert 170 <= f_kick[0][0] <= 200, f"Neon kick should be Cyan, got {f_kick[0][0]}"
+    assert 300 <= f_snare[0][0] <= 335, f"Neon snare should be Magenta, got {f_snare[0][0]}"
+
+    # 2. SubBlast: Advances hue on distinct bass ripples; strobes white on extreme bass
+    sub = SubBlastStyle()
+    st_blast1 = MusicState(energy=0.8, kick=0.9, sub_bass=0.9, transient=0.8)
+    f_blast1 = sub.render(st_blast1, dt=0.03, num_zones=1)
+    sub._blast_radius = 20.0  # Allow re-trigger
+    st_blast2 = MusicState(energy=0.8, kick=0.95, sub_bass=0.95, transient=0.85)
+    f_blast2 = sub.render(st_blast2, dt=0.03, num_zones=1)
+    assert f_blast1[0][0] != f_blast2[0][0], "SubBlast must advance hue on successive ripples"
+
+    # Extreme bass white strobe
+    st_extreme = MusicState(energy=0.9, kick=0.95, sub_bass=0.8, is_extreme_bass=True)
+    f_extreme = sub.render(st_extreme, dt=0.01, num_zones=1)
+    assert f_extreme[0][1] == 0 and f_extreme[0][2] >= 90, "Extreme bass must strobe crisp white"
+
+    # 3. VocalGlow: Reacts strongly to vocal band, dims when only bass
+    vocal = VocalGlowStyle()
+    bands_vocal = np.zeros(50, dtype=np.float32)
+    bands_vocal[12:35] = 0.85
+    st_vocal = MusicState(energy=0.7, bands=bands_vocal, mid=0.85)
+    f_vocal = vocal.render(st_vocal, dt=0.1, num_zones=1)
+
+    bands_bass_only = np.zeros(50, dtype=np.float32)
+    bands_bass_only[:6] = 0.95
+    st_bass_only = MusicState(energy=0.4, bands=bands_bass_only, mid=0.05, kick=0.95)
+    f_bass_only = vocal.render(st_bass_only, dt=0.1, num_zones=1)
+    assert f_vocal[0][2] > f_bass_only[0][2], "VocalGlow must respond more strongly to vocal band than bass"
+
+    # 4. BpmResonator: Bar 0 downbeat accent > offbeat
+    res = BpmResonatorStyle()
+    st_downbeat = MusicState(energy=0.6, bar_pos=0, beat_phase=0.05, bpm=120.0, bpm_confidence=0.9)
+    st_offbeat = MusicState(energy=0.6, bar_pos=1, beat_phase=0.05, bpm=120.0, bpm_confidence=0.9)
+    f_down = res.render(st_downbeat, dt=0.03, num_zones=1)
+    f_off = res.render(st_offbeat, dt=0.03, num_zones=1)
+    assert f_down[0][2] > f_off[0][2], "BpmResonator downbeat must have higher brightness accent"
+
+    # 5. AcousticString: Pluck causes sharp desaturation shimmer
+    string = AcousticStringStyle()
+    st_pluck = MusicState(energy=0.6, transient=0.9, onset=0.9)
+    st_sustain = MusicState(energy=0.6, transient=0.1, onset=0.1)
+    f_pluck = string.render(st_pluck, dt=0.03, num_zones=1)
+    f_sust = string.render(st_sustain, dt=0.03, num_zones=1)
+    assert f_pluck[0][1] < f_sust[0][1], "Pluck must trigger desaturated metallic shimmer"
+
+    # 6. HydroAcoustic: Kick gives turquoise (170-185), Hat gives seafoam (185-200)
+    hydro = HydroAcousticStyle()
+    f_h_kick = hydro.render(MusicState(energy=0.5, kick=0.8, hat=0.0), dt=0.03, num_zones=1)
+    f_h_hat = hydro.render(MusicState(energy=0.3, kick=0.0, hat=0.8), dt=0.03, num_zones=1)
+    assert 170 <= f_h_kick[0][0] <= 180, f"Hydro kick must be turquoise, got {f_h_kick[0][0]}"
+    assert 185 <= f_h_hat[0][0] <= 195, f"Hydro hat must be seafoam, got {f_h_hat[0][0]}"
+
+    # 7. LofiVinyl: Warm vintage amber/gold glow without harsh strobe
+    lofi = LofiVinylStyle()
+    f_lofi = lofi.render(MusicState(energy=0.5, bass=0.4), dt=0.05, num_zones=1)
+    assert 15 <= f_lofi[0][0] <= 55, f"LofiVinyl hue must be warm amber/gold, got {f_lofi[0][0]}"
+
+    # 8. MelodicContour: Pitch centroid shifts hue
+    contour = MelodicContourStyle()
+    f_low = contour.render(MusicState(energy=0.6, centroid_norm=0.1), dt=0.03, num_zones=1)
+    f_high = contour.render(MusicState(energy=0.6, centroid_norm=0.8), dt=0.03, num_zones=1)
+    assert f_low[0][0] != f_high[0][0], "MelodicContour must change room hue with pitch centroid"
+
+    # 9. Twinkle: Sparkle on hi-hat vs ambient
+    twinkle = TwinkleStyle()
+    f_tw_quiet = twinkle.render(MusicState(energy=0.2, hat=0.0), dt=0.03, num_zones=1)
+    f_tw_sparkle = twinkle.render(MusicState(energy=0.2, hat=0.9, onset=0.8), dt=0.03, num_zones=1)
+    assert f_tw_sparkle[0][2] > f_tw_quiet[0][2], "Twinkle must sparkle on hi-hat transient"
 

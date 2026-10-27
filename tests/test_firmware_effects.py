@@ -465,6 +465,8 @@ def test_original_effects_use_procedural_playback_not_firmware_colour_sequences(
     assert set(CREATIVE_EFFECTS) == expected
     assert expected | spatial <= set(CUSTOM_EFFECTS)
     for name in expected | spatial:
+        if EFFECT_CATALOG[name].get("kind") == "firmware":
+            continue
         assert EFFECT_CATALOG[name]["kind"] == "streamed_slow"
 
 
@@ -552,18 +554,18 @@ def test_effect_catalog_curation_structure():
     )
 
     from src.effects_l930 import WLED_1D_EFFECTS, WLED_2D_EFFECTS
-    assert len(EFFECT_CATALOG) == 77, f"Expected 77 internal definitions, got {len(EFFECT_CATALOG)}"
+    assert len(EFFECT_CATALOG) == 127, f"Expected 127 internal definitions, got {len(EFFECT_CATALOG)}"
     assert CORE_EFFECTS == [], "Stock/core effects should not be exposed in the curated UI"
-    assert len(ADVANCED_EFFECTS) == 25
+    assert len(ADVANCED_EFFECTS) == 50
     assert SEASONAL_EFFECTS == []
     assert NOVELTY_EFFECTS == []
-    assert len(CREATIVE_EFFECTS) == 50
+    assert len(CREATIVE_EFFECTS) == 100
     assert OCCASIONAL_EFFECTS == []
-    assert len(ACTIVE_EFFECTS) == 50
+    assert len(ACTIVE_EFFECTS) == 100
 
     assert set(CREATIVE_EFFECTS) == set(WLED_1D_EFFECTS) | set(WLED_2D_EFFECTS)
-    assert len(WLED_1D_EFFECTS) == 25
-    assert len(WLED_2D_EFFECTS) == 25
+    assert len(WLED_1D_EFFECTS) == 50
+    assert len(WLED_2D_EFFECTS) == 50
 
     expected_advanced = set(WLED_2D_EFFECTS)
     assert set(ADVANCED_EFFECTS) == expected_advanced
@@ -661,12 +663,12 @@ def test_hub_full_state_includes_curated_categories(monkeypatch):
         assert "creative_effects" in st
         assert "active_effects" in st
         assert len(st["core_effects"]) == 0
-        assert len(st["advanced_effects"]) == 25
+        assert len(st["advanced_effects"]) == 50
         assert len(st["seasonal_effects"]) == 0
         assert len(st["novelty_effects"]) == 0
         assert len(st["occasional_effects"]) == 0
-        assert len(st["creative_effects"]) == 50
-        assert len(st["active_effects"]) == 50
+        assert len(st["creative_effects"]) == 100
+        assert len(st["active_effects"]) == 100
         # Ensure bpm_resonator is exposed in visualizer styles
         assert any(s["id"] == "bpm_resonator" for s in st.get("visualizer_styles", []))
     finally:

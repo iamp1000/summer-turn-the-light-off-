@@ -62,7 +62,10 @@ def is_session_timeout(e: Exception) -> bool:
 def safe_notify(title: str, message: str):
     """Safely dispatches desktop toast notification without crashing headless threads."""
     import sys
-    if "pytest" in sys.modules:
+    log.info(f"[{title}] {message}")
+    if "pytest" in sys.modules or sys.platform == "win32":
+        # On Windows, plyer spawns unmanaged balloon_tip threads that raise
+        # unhandled 'Shell_NotifyIconW failed' exceptions alongside pystray.
         return
     try:
         notification.notify(
@@ -216,13 +219,13 @@ class L930Controller:
         # Replacing configured zero with the music fade interrupts every prior ramp.
         self.default_transition_ms = None if trans_ms is None else max(0, int(trans_ms))
         self.music_transition_ms = max(
-            0, int(calib.get("music_transition_ms", 120)
-                   if isinstance(calib, dict) else 120)
+            0, int(calib.get("music_transition_ms", 0)
+                   if isinstance(calib, dict) else 0)
         )
         self.movie_transition_ms = calib.get("movie_transition_ms", 800) if isinstance(calib, dict) else 800
         self._max_updates_per_s = float(calib.get("max_updates_per_s", 8.0) if isinstance(calib, dict) else 8.0)
         self._movie_max_updates_per_s = float(calib.get("movie_max_updates_per_s", 2.0) if isinstance(calib, dict) else 2.0)
-        self._min_zone_delta = float(calib.get("min_zone_delta", 1.5) if isinstance(calib, dict) else 1.5)
+        self._min_zone_delta = float(calib.get("min_zone_delta", 1.0) if isinstance(calib, dict) else 1.0)
 
         from src.pipeline import RenderPipeline
         self._render_pipeline = RenderPipeline(
@@ -288,10 +291,10 @@ class L930Controller:
         import src.tapo_patch  # Ensure robustness patches are active
         self.diagnostics.record_reconnect()
 
-        # Try TPAP first (standard on L930 v1.4+ firmware), fallback to KLAP v2, then auto-guess
+        # Try KLAP v2 first (standard on L930 firmware), fallback to TPAP, then auto-guess
         attempts = [
-            {"encryption_type": "tpap"},
             {"encryption_type": "klap", "encryption_version": 2},
+            {"encryption_type": "tpap"},
             {},
         ]
         last_exc = None
@@ -314,8 +317,74 @@ class L930Controller:
                 last_exc = e
                 log.debug(f"[{self.dev_id}] Connect attempt with {opts} failed: {e}")
 
+        # If direct connection to self._ip fails, attempt subnet discovery to find relocated L930
+        discovered_ip = await self._discover_ip_on_subnet()
+        if discovered_ip and discovered_ip != self._ip:
+            log.info(f"[{self.dev_id}] Relocated L930 on subnet at {discovered_ip} (was {self._ip}); connecting...")
+            self._ip = discovered_ip
+            for opts in attempts:
+                try:
+                    config = DeviceConnectConfiguration(
+                        host=self._ip,
+                        credentials=self._credentials,
+                        **opts,
+                    )
+                    self._device = await connect(config)
+                    await self._device.update()
+                    self._is_on = getattr(self._device, "is_on", True)
+                    self._backoff_time = 0.5
+                    self._last_successful_response = time.time()
+                    self.diagnostics.set_status("connected")
+                    log.info(f"[{self.dev_id}] Connected to L930 at relocated IP {self._ip} ({opts})")
+                    return self._device
+                except Exception as e:
+                    last_exc = e
+
         self.diagnostics.record_error(str(last_exc))
         raise last_exc
+
+    async def _discover_ip_on_subnet(self) -> str | None:
+        """Probes the local /24 subnet for an L930 device if the configured IP became unreachable."""
+        import socket
+        try:
+            parts = self._ip.split(".")
+            if len(parts) != 4:
+                return None
+            prefix = ".".join(parts[:3])
+            open_ips = []
+            for i in range(1, 35):
+                candidate = f"{prefix}.{i}"
+                if candidate == self._ip:
+                    continue
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.06)
+                try:
+                    if s.connect_ex((candidate, 80)) == 0:
+                        open_ips.append(candidate)
+                except Exception:
+                    pass
+                finally:
+                    s.close()
+
+            for candidate in open_ips:
+                try:
+                    cfg = DeviceConnectConfiguration(
+                        host=candidate,
+                        credentials=self._credentials,
+                        timeout=1.0,
+                        guess_timeout=2.0,
+                        encryption_type="klap",
+                        encryption_version=2,
+                    )
+                    dev = await connect(cfg)
+                    await dev.update()
+                    if getattr(dev, "model", "").upper() == "L930":
+                        return candidate
+                except Exception:
+                    pass
+        except Exception as exc:
+            log.debug(f"[{self.dev_id}] Subnet discovery notice: {exc}")
+        return None
 
     async def _ensure_connected(self):
         if self._device is None and not self._reconnecting:
@@ -421,7 +490,7 @@ class L930Controller:
         if not self._is_on:
             return False
 
-        trans = getattr(self, "music_transition_ms", 120)
+        trans = getattr(self, "music_transition_ms", 0)
         pre_corrected = False
         if isinstance(frame, dict):
             raw_segments = frame.get("segments", self.last_segments)
@@ -547,11 +616,13 @@ class L930Controller:
         async with self._lock:
             try:
                 await self._ensure_connected()
-                await self._device.turn_on()
+                if self._device is not None:
+                    await self._device.turn_on()
                 self._is_on = True
                 self._last_successful_response = time.time()
                 self.diagnostics.set_status("connected")
             except Exception as e:
+                self._is_on = False
                 asyncio.create_task(self._handle_failure(e))
 
     async def turn_off(self, priority: int = 0):
@@ -561,23 +632,24 @@ class L930Controller:
         async with self._lock:
             try:
                 await self._ensure_connected()
-                # Clear active dynamic light effect to prevent L930 board overload
-                try:
-                    off_effect = LightEffect(
-                        id=_STATIC_EFFECT_ID,
-                        name="Off",
-                        display_colors=[],
-                        enable=0,
-                        brightness=0,
-                        custom=0,
-                        segments=[0],
-                        sequence=[[0, 0, 0]] * NUM_SEGMENTS,
-                        type="static"
-                    )
-                    await self._device.set_light_effect(off_effect)
-                except Exception:
-                    pass
-                await self._device.turn_off()
+                if self._device is not None:
+                    # Clear active dynamic light effect to prevent L930 board overload
+                    try:
+                        off_effect = LightEffect(
+                            id=_STATIC_EFFECT_ID,
+                            name="Off",
+                            display_colors=[],
+                            enable=0,
+                            brightness=0,
+                            custom=0,
+                            segments=[0],
+                            sequence=[[0, 0, 0]] * NUM_SEGMENTS,
+                            type="static"
+                        )
+                        await self._device.set_light_effect(off_effect)
+                    except Exception:
+                        pass
+                    await self._device.turn_off()
                 self.last_segments = [[0, 0, 0]] * NUM_SEGMENTS
                 self._last_successful_response = time.time()
                 self.diagnostics.set_status("off")

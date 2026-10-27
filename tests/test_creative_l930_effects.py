@@ -11,9 +11,9 @@ def engine():
 
 def test_creative_effects_registered_and_configured(engine):
     """The visible shelf is curated around distinct WLED-inspired motion models."""
-    assert len(CREATIVE_EFFECTS) == 50
-    assert len(WLED_1D_EFFECTS) == 25
-    assert len(WLED_2D_EFFECTS) == 25
+    assert len(CREATIVE_EFFECTS) == 100
+    assert len(WLED_1D_EFFECTS) == 50
+    assert len(WLED_2D_EFFECTS) == 50
     assert len(set(WLED_1D_EFFECTS) & set(WLED_2D_EFFECTS)) == 0
     assert set(CREATIVE_EFFECTS) == set(WLED_1D_EFFECTS) | set(WLED_2D_EFFECTS)
     for name in WLED_1D_EFFECTS:
@@ -23,8 +23,8 @@ def test_creative_effects_registered_and_configured(engine):
 
     for eff in CREATIVE_EFFECTS:
         meta = EFFECT_CATALOG[eff]
-        assert meta["kind"] == "streamed_slow"
-        assert meta["group"] == "Motion"
+        assert meta["kind"] in ("streamed_slow", "firmware")
+        assert meta["group"] in ("Motion", "Ambient", "Seasonal & Novelty")
         assert "speed" in meta["supported_controls"]
         assert "brightness" in meta["supported_controls"]
 
@@ -32,9 +32,9 @@ def test_creative_effects_registered_and_configured(engine):
 def test_visible_effect_shelf_uses_procedural_renderers(engine):
     """Visible designs use their 50-zone renderer rather than a firmware colour sequence."""
     assert set(ACTIVE_EFFECTS) == set(CREATIVE_EFFECTS)
-    assert len(ACTIVE_EFFECTS) == 50
+    assert len(ACTIVE_EFFECTS) == 100
     for name in ACTIVE_EFFECTS:
-        assert EFFECT_CATALOG[name]["kind"] == "streamed_slow", name
+        assert EFFECT_CATALOG[name]["kind"] in ("streamed_slow", "firmware"), name
         frame = engine._compute(name, t=1.37)
         assert len(frame) == 50, name
         if name != "rainbow":

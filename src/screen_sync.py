@@ -94,9 +94,10 @@ def detect_letterbox_bounds(img: np.ndarray, black_thresh: int = 14) -> Tuple[in
 
 def extract_dominant_color_weighted(bgr_pixels: np.ndarray, sat_boost: float = 1.30) -> Tuple[int, int, int]:
     """
-    Saturation-weighted dominant color extractor.
-    Gives exponential weight to vibrant/saturated pixels so ambient lights pop
-    instead of turning into a washed-out grey average.
+    High-fidelity screen color and luminance extractor.
+    Color is driven by vivid chromatic clusters (preventing grey/brown mud).
+    Brightness scales with active content luminance and human perceptual vision,
+    ensuring rich, room-filling ambilight glow without dark scene crushing.
     """
     if len(bgr_pixels) == 0:
         return (0, 0, 50)
@@ -109,28 +110,60 @@ def extract_dominant_color_weighted(bgr_pixels: np.ndarray, sat_boost: float = 1
     min_c = np.minimum(np.minimum(r, g), b)
     delta = max_c - min_c
 
-    sat = np.where(max_c > 0.001, delta / max_c, 0.0)
+    sat = np.where(max_c > 0.001, delta / np.maximum(0.001, max_c), 0.0)
     lum = 0.299 * r + 0.587 * g + 0.114 * b
 
-    # Saturation exponential weighting
-    weights = ((sat + 0.12) ** 2.2) * (lum + 0.08)
+    # Chromatic weighting: prioritize pixels with genuine saturation and meaningful luminance
+    weights = ((sat + 0.08) ** 2.4) * (np.sqrt(np.maximum(0.02, lum)))
     sum_w = float(np.sum(weights))
 
     if sum_w <= 0.001:
-        mean_b = float(np.mean(b))
-        mean_g = float(np.mean(g))
-        mean_r = float(np.mean(r))
+        dom_b = float(np.mean(b))
+        dom_g = float(np.mean(g))
+        dom_r = float(np.mean(r))
     else:
-        mean_b = float(np.sum(b * weights) / sum_w)
-        mean_g = float(np.sum(g * weights) / sum_w)
-        mean_r = float(np.sum(r * weights) / sum_w)
+        dom_b = float(np.sum(b * weights) / sum_w)
+        dom_g = float(np.sum(g * weights) / sum_w)
+        dom_r = float(np.sum(r * weights) / sum_w)
 
-    hc, sc, vc = colorsys.rgb_to_hsv(mean_r, mean_g, mean_b)
-    # Apply vivid saturation & contrast curve
-    sc = min(1.0, sc * sat_boost)
-    vc = min(1.0, (vc ** 0.70))
+    avg_b = float(np.mean(b))
+    avg_g = float(np.mean(g))
+    avg_r = float(np.mean(r))
 
-    return (int(round(hc * 360.0)) % 360, int(round(sc * 100.0)), max(5, min(100, int(round(vc * 100.0)))))
+    # Determine vividness confidence: if saturated pixels exist, let them define the hue!
+    # Do NOT drag vivid colors into muddy dark grey by flat 50/50 blending.
+    max_sat = float(np.max(sat)) if len(sat) > 0 else 0.0
+    vivid_confidence = max(0.0, min(1.0, (max_sat - 0.08) / 0.20))
+    dom_blend = 0.85 * vivid_confidence + 0.15 * (1.0 - vivid_confidence)
+
+    blend_r = dom_blend * dom_r + (1.0 - dom_blend) * avg_r
+    blend_g = dom_blend * dom_g + (1.0 - dom_blend) * avg_g
+    blend_b = dom_blend * dom_b + (1.0 - dom_blend) * avg_b
+
+    hc, sc, _ = colorsys.rgb_to_hsv(blend_r, blend_g, blend_b)
+    # Boost saturation appropriately for Tapo RGB LEDs (which have wide color gamut)
+    sc = min(1.0, sc * sat_boost * 1.25)
+
+    # Luminance calculation:
+    # Instead of crushing by black_ratio, identify active content luminance.
+    # Games and movies with dark backgrounds or letterbox bars should illuminate active colors brightly.
+    avg_lum = float(np.mean(lum))
+    active_mask = lum > 0.03
+    if np.any(active_mask):
+        active_lum = float(np.mean(lum[active_mask]))
+        # Blend active content luminance with average luminance (75% active content weight)
+        effective_lum = 0.75 * active_lum + 0.25 * avg_lum
+    else:
+        effective_lum = avg_lum
+
+    # Perceptual square root gamma lift: produces healthy 45-95% room illumination
+    if effective_lum < 0.015:
+        vc = max(0.0, effective_lum * 4.0)  # Pure black / display sleep drops to 0
+    else:
+        # Perceptual lift curve
+        vc = min(1.0, max(0.35, math.sqrt(effective_lum) * 1.15 + 0.15))
+
+    return (int(round(hc * 360.0)) % 360, int(round(sc * 100.0)), max(0, min(100, int(round(vc * 100.0)))))
 
 
 SCREEN_PROFILES = {
@@ -173,13 +206,14 @@ class ScreenSync:
       - Video / Gaming / Desktop tuning profiles
     """
 
-    def __init__(self, controller, loop_runner, app_state, frame_bus: Any = None, dev_id: str = "strip2"):
+    def __init__(self, controller, loop_runner, app_state, frame_bus: Any = None, dev_id: str = "strip2", audio_coordinator: Any = None):
         self._controller = controller
         self._loop_runner = loop_runner
         self._app_state = app_state
         self._frame_bus = frame_bus
         self._dev_id = dev_id
         self._output_token: Optional[tuple[int, str]] = None
+        self._audio_coordinator = audio_coordinator
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -195,6 +229,8 @@ class ScreenSync:
         self._smoothed_global_hsv: Optional[Tuple[int, int, int]] = None
         self._smoothed_columns: Optional[List[Tuple[int, int, int]]] = None
         self._last_scene_cut = False
+        self._vocal_env: float = 0.0
+        self._theme_intensity_env: float = 0.0
         self.latest_screen_data: ScreenData = ScreenData()
 
         self._load_config()
@@ -227,6 +263,11 @@ class ScreenSync:
     def start(self):
         if self._running:
             return
+        if self._audio_coordinator:
+            if hasattr(self._audio_coordinator, "register_subscriber"):
+                self._audio_coordinator.register_subscriber(self)
+            if hasattr(self._audio_coordinator, "start"):
+                self._audio_coordinator.start()
         self._output_token = (
             self._frame_bus.capture_token(self._dev_id, OutputProducer.SCREEN_SYNC)
             if self._frame_bus else None
@@ -237,6 +278,8 @@ class ScreenSync:
 
     def stop(self):
         self._running = False
+        if self._audio_coordinator and hasattr(self._audio_coordinator, "unregister_subscriber"):
+            self._audio_coordinator.unregister_subscriber(self)
         if hasattr(self._controller, "clear_frames"):
             self._controller.clear_frames()
         if self._camera:
@@ -338,7 +381,7 @@ class ScreenSync:
         return hue, max(0, min(100, sat)), max(0, min(100, val))
 
     def _dispatch(self, segs, global_hsv, is_l930: bool, profile: dict):
-        """Smooth dominant and per-zone screen colors, including abrupt scene cuts."""
+        """Smooth dominant and per-zone screen colors, including abrupt scene cuts and audio vocal reactivity."""
         cut_thresh = float(profile["cut_threshold"])
         master_ceiling = self._app_state.get("brightness", 100) / 100.0
 
@@ -389,7 +432,7 @@ class ScreenSync:
             )
 
         # Normal motion follows the existing video/gaming/desktop profile;
-        # hard cuts use a significantly longer time constant instead of snapping.
+        # hard cuts use a longer time constant to prevent jarring flashes.
         profile_tau = {"video": 0.24, "gaming": 0.16, "desktop": 0.32}.get(self._profile_name, 0.24)
         cut_tau = max(0.72, profile_tau * 3.5)
         tau = cut_tau if is_cut else profile_tau
@@ -432,6 +475,65 @@ class ScreenSync:
             else:
                 smoothed_segs = self._zone_smoother.update(smoothed_columns, dt=dt)
 
+            # Check audio coordinator for vocal presence and theme music intensity build-up
+            vocal_boost = 0.0
+            theme_boost = 0.0
+            ast = None
+            if self._audio_coordinator:
+                if hasattr(self._audio_coordinator, "get_latest_state"):
+                    ast, _ = self._audio_coordinator.get_latest_state()
+                elif hasattr(self._audio_coordinator, "latest_state"):
+                    ast = getattr(self._audio_coordinator, "latest_state")
+
+            if ast and (getattr(ast, "energy", 0.0) > 0.01 or getattr(ast, "mid", 0.0) > 0.01 or getattr(ast, "speech_dominance", 0.0) > 0.1):
+                # 1. Vocal & Speech presence extraction (300 Hz - 3.4 kHz speech band)
+                bands = getattr(ast, "bands", None)
+                if bands is not None and len(bands) >= 35:
+                    vocal_raw = float(np.mean(bands[12:35]))
+                else:
+                    vocal_raw = float(getattr(ast, "mid", 0.0))
+                speech_d = float(getattr(ast, "speech_dominance", 0.0))
+                target_vocal = max(0.0, min(1.0, max(vocal_raw * 1.5, getattr(ast, "mid", 0.0) * 1.3) + speech_d * 0.5))
+
+                # 2. Theme music sound building up intensity (soundtrack energy & harmonic tension)
+                energy = float(getattr(ast, "energy", 0.0))
+                harmonic = float(getattr(ast, "harmonic_ratio", 0.5))
+                target_theme = max(0.0, min(1.0, energy * (0.70 + max(0.0, harmonic - 0.25) * 0.40)))
+
+                if previous_columns is None and self._vocal_env == 0.0:
+                    self._vocal_env = target_vocal
+                    self._theme_intensity_env = target_theme
+                else:
+                    tau_vocal = 0.08 if target_vocal > self._vocal_env else 0.32
+                    alpha_vocal = 1.0 - math.exp(-dt / tau_vocal)
+                    self._vocal_env += alpha_vocal * (target_vocal - self._vocal_env)
+
+                    tau_theme = 0.14 if target_theme > self._theme_intensity_env else 0.48
+                    alpha_theme = 1.0 - math.exp(-dt / tau_theme)
+                    self._theme_intensity_env += alpha_theme * (target_theme - self._theme_intensity_env)
+
+                vocal_boost = self._vocal_env * 30.0
+                theme_boost = self._theme_intensity_env * 34.0
+            else:
+                self._vocal_env = max(0.0, self._vocal_env * 0.85)
+                self._theme_intensity_env = max(0.0, self._theme_intensity_env * 0.85)
+
+            if vocal_boost > 0.5 or theme_boost > 0.5:
+                sat_bloom = 1.0 + (self._vocal_env * 0.18 + self._theme_intensity_env * 0.25)
+                for idx in range(min(50, len(smoothed_segs))):
+                    dist_c = abs(idx - 24.5)
+                    # Dialogue/vocals radiate warmly from screen center (+20-35% boost)
+                    vocal_halo = 0.40 + 0.60 * math.exp(-0.5 * (dist_c / 14.0) ** 2)
+                    # Theme music builds up smoothly across the ambient room (+18-30% boost)
+                    theme_spread = 0.85 + 0.15 * math.exp(-0.5 * (dist_c / 18.0) ** 2)
+                    boost = vocal_boost * vocal_halo + theme_boost * theme_spread
+                    zone_v = smoothed_segs[idx][2] * master_ceiling
+                    smoothed_segs[idx][2] = max(0, min(100, int(round(zone_v + boost))))
+                    smoothed_segs[idx][1] = max(5, min(100, int(round(smoothed_segs[idx][1] * sat_bloom))))
+            else:
+                for idx in range(min(50, len(smoothed_segs))):
+                    smoothed_segs[idx][2] = max(0, min(100, int(round(smoothed_segs[idx][2] * master_ceiling))))
+
             self._rendered_segs = smoothed_segs
             scaled_b = max(1, int(100 * master_ceiling))
 
@@ -446,6 +548,7 @@ class ScreenSync:
                 "segments": smoothed_segs,
                 "brightness": scaled_b,
                 "transition": transition,
+                "_pre_corrected": True,
             }
             if self._frame_bus:
                 if self._output_token:
@@ -458,8 +561,58 @@ class ScreenSync:
                 self._controller.submit_frame(frame)
         else:
             gh, gs, gv = smoothed_global
-            final_b = max(1, int(gv * master_ceiling))
-            frame = {"h": gh, "s": gs, "b": final_b}
+            vocal_boost = 0.0
+            theme_boost = 0.0
+            ast = None
+            if self._audio_coordinator:
+                if hasattr(self._audio_coordinator, "get_latest_state"):
+                    ast, _ = self._audio_coordinator.get_latest_state()
+                elif hasattr(self._audio_coordinator, "latest_state"):
+                    ast = getattr(self._audio_coordinator, "latest_state")
+
+            if ast and (getattr(ast, "energy", 0.0) > 0.01 or getattr(ast, "mid", 0.0) > 0.01 or getattr(ast, "speech_dominance", 0.0) > 0.1):
+                bands = getattr(ast, "bands", None)
+                if bands is not None and len(bands) >= 35:
+                    vocal_raw = float(np.mean(bands[12:35]))
+                else:
+                    vocal_raw = float(getattr(ast, "mid", 0.0))
+                speech_d = float(getattr(ast, "speech_dominance", 0.0))
+                target_vocal = max(0.0, min(1.0, max(vocal_raw * 1.5, getattr(ast, "mid", 0.0) * 1.3) + speech_d * 0.5))
+
+                energy = float(getattr(ast, "energy", 0.0))
+                harmonic = float(getattr(ast, "harmonic_ratio", 0.5))
+                target_theme = max(0.0, min(1.0, energy * (0.70 + max(0.0, harmonic - 0.25) * 0.40)))
+
+                if previous_global is None and self._vocal_env == 0.0:
+                    self._vocal_env = target_vocal
+                    self._theme_intensity_env = target_theme
+                else:
+                    tau_vocal = 0.08 if target_vocal > self._vocal_env else 0.32
+                    alpha_vocal = 1.0 - math.exp(-dt / tau_vocal)
+                    self._vocal_env += alpha_vocal * (target_vocal - self._vocal_env)
+
+                    tau_theme = 0.14 if target_theme > self._theme_intensity_env else 0.48
+                    alpha_theme = 1.0 - math.exp(-dt / tau_theme)
+                    self._theme_intensity_env += alpha_theme * (target_theme - self._theme_intensity_env)
+
+                # Noticeable organic swell on L900: provides a clear, luminous lift (+25% to +35%)
+                vocal_boost = self._vocal_env * 32.0
+                theme_boost = self._theme_intensity_env * 35.0
+            else:
+                self._vocal_env = max(0.0, self._vocal_env * 0.85)
+                self._theme_intensity_env = max(0.0, self._theme_intensity_env * 0.85)
+
+            combined_lift = vocal_boost * 0.85 + theme_boost * 0.90
+            base_b = gv * master_ceiling
+            final_b = max(0, min(100, int(round(base_b + combined_lift)))) if gv > 0 else 0
+
+            # Rich color saturation bloom when music and vocals swell
+            if vocal_boost > 0.5 or theme_boost > 0.5:
+                sat_bloom = 1.0 + (self._vocal_env * 0.20 + self._theme_intensity_env * 0.26)
+                final_s = max(5, min(100, int(round(gs * sat_bloom))))
+            else:
+                final_s = gs
+            frame = {"h": gh, "s": final_s, "b": final_b, "_pre_corrected": True}
             if self._frame_bus:
                 if self._output_token:
                     generation, producer_id = self._output_token

@@ -102,3 +102,87 @@ class MusicBrightnessFloor:
             h, s, v = int(zone[0]) % 360, max(0, min(100, int(zone[1]))), max(0, min(100, int(zone[2])))
             result.append([h, s, max(v, floor_int)] if v > 0 else [0, 0, 0])
         return result
+
+
+class ZoneTemporalSmoother:
+    """
+    Antialiased temporal smoothing filter for 50-zone addressable LED strips.
+    Smooths sharp discrete jumps in brightness and hue across successive frames
+    while preserving zero-latency instant attack on musical transients and beats.
+    """
+
+    def __init__(self, num_zones: int = 50, attack_tau: float = 0.0, decay_tau: float = 0.040):
+        self.num_zones = num_zones
+        self.attack_tau = attack_tau
+        self.decay_tau = decay_tau
+        self._cur_h = [0.0] * num_zones
+        self._cur_s = [0.0] * num_zones
+        self._cur_v = [0.0] * num_zones
+        self._initialized = False
+
+    def reset(self):
+        self._cur_v = [0.0] * self.num_zones
+        self._initialized = False
+
+    def process(
+        self,
+        target_segs: Sequence[Sequence[int]],
+        dt: float,
+        white_punch: float = 0.0,
+        strobe: bool = False,
+    ) -> list[list[int]]:
+        num = min(len(target_segs), self.num_zones)
+        dt = max(0.001, min(0.15, float(dt)))
+
+        if not self._initialized:
+            for i in range(num):
+                self._cur_h[i] = float(target_segs[i][0])
+                self._cur_s[i] = float(target_segs[i][1])
+                self._cur_v[i] = float(target_segs[i][2])
+            self._initialized = True
+
+        out: list[list[int]] = []
+        punch_active = white_punch > 15.0 or strobe
+        punch_ratio = min(1.0, (white_punch - 15.0) / 85.0) if white_punch > 15.0 else (1.0 if strobe else 0.0)
+
+        for i in range(num):
+            th, ts, tv = float(target_segs[i][0]), float(target_segs[i][1]), float(target_segs[i][2])
+
+            # White strobe / extreme bass flash compositing
+            if punch_active and tv > 10.0:
+                ts = ts * (1.0 - punch_ratio * 0.90)
+                tv = min(100.0, tv + (100.0 - tv) * punch_ratio)
+
+            # Asymmetric brightness smoothing: instant snappy attack, clean musical decay
+            if tv > self._cur_v[i]:
+                # Instant attack: beats land with immediate impact (0 lag)
+                if self.attack_tau <= 0.005:
+                    self._cur_v[i] = tv
+                else:
+                    alpha_v = 1.0 - math.exp(-dt / self.attack_tau)
+                    self._cur_v[i] += alpha_v * (tv - self._cur_v[i])
+            else:
+                alpha_v = 1.0 - math.exp(-dt / max(0.005, self.decay_tau))
+                self._cur_v[i] += alpha_v * (tv - self._cur_v[i])
+
+            if tv <= 0.5 and self._cur_v[i] < 1.0:
+                self._cur_v[i] = 0.0
+
+            # If zone was dark or leaping up, snap hue and saturation instantly
+            if self._cur_v[i] < 2.0 or tv > self._cur_v[i] * 1.5:
+                self._cur_h[i] = th
+                self._cur_s[i] = ts
+            else:
+                diff_h = ((th - self._cur_h[i] + 180.0) % 360.0) - 180.0
+                alpha_h = 1.0 - math.exp(-dt / 0.020)
+                self._cur_h[i] = (self._cur_h[i] + alpha_h * diff_h) % 360.0
+
+                alpha_s = 1.0 - math.exp(-dt / 0.020)
+                self._cur_s[i] += alpha_s * (ts - self._cur_s[i])
+
+            final_h = int(round(self._cur_h[i])) % 360
+            final_s = max(0, min(100, int(round(self._cur_s[i]))))
+            final_v = max(0, min(100, int(round(self._cur_v[i]))))
+            out.append([final_h, final_s, final_v])
+
+        return out
