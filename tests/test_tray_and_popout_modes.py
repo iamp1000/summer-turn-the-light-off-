@@ -99,6 +99,13 @@ def test_tapo_gui_mode_lifecycle(fake_hub):
         # 6. Test hide_window() and toggle_tray_window()
         gui.hide_window()
         gui.toggle_tray_window()
+
+        # 7. Test starred effects filter
+        assert isinstance(gui.starred_effects, set)
+        gui._set_fx_filter("starred")
+        assert gui._fx_filter_mode == "starred"
+        gui._set_fx_filter("all")
+        assert gui._fx_filter_mode == "all"
     finally:
         gui.app.destroy()
 
@@ -108,17 +115,4 @@ def test_make_window_stay_in_taskbar():
     mock_win = MagicMock()
     mock_win.winfo_id.return_value = 0
     make_window_stay_in_taskbar(mock_win)
-
-
-def test_starred_effects_filtering_and_toggle(fake_hub):
-    on_quit = MagicMock()
-    gui = TapoGUI(fake_hub, on_quit=on_quit, default_mode="normal")
-    try:
-        assert isinstance(gui.starred_effects, set)
-        gui._set_fx_filter("starred")
-        assert gui._fx_filter_mode == "starred"
-        gui._set_fx_filter("all")
-        assert gui._fx_filter_mode == "all"
-    finally:
-        gui.app.destroy()
 

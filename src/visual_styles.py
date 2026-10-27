@@ -117,11 +117,15 @@ def exp_smooth_fast(current: float, target: float, dt: float, tau: float) -> flo
 
 class BuildTensionAccent:
     """
-    During Section.BUILD, narrows lit area toward centre, dims baseline slightly,
-    and increases contrast. Persistent envelope lasting >2 send periods.
+    Unified Riser & Drop Build-up Engine for L930 (Active in all music modes):
+    During Section.BUILD, pulses accelerate exponentially with growing tempo and section progress:
+    1/4 notes -> 1/8 notes -> 1/16 notes -> 1/32 notes -> hyper-strobe right into the drop!
+    Concentrates energy toward center, desaturates toward blinding white at peak tension,
+    and drops to momentary pitch black right before the drop explosion.
     """
     def __init__(self):
         self.tension_env: float = 0.0
+        self._build_time: float = 0.0
 
     def render_accent(
         self,
@@ -132,20 +136,34 @@ class BuildTensionAccent:
     ) -> List[Tuple[int, int, int]]:
         is_build = (state.section == Section.BUILD)
         target_t = state.tension if is_build else 0.0
-        # Envelope: attack 200ms, decay 600ms
         tau = 0.20 if target_t > self.tension_env else 0.60
         self.tension_env = exp_smooth_fast(self.tension_env, target_t, dt, tau)
 
         if self.tension_env < 0.04 or len(frame) <= 1:
+            self._build_time = 0.0
             return frame
 
+        self._build_time += dt
         half = (num_zones - 1) / 2.0
+        bpm = max(60.0, min(180.0, float(getattr(state, "bpm", 120.0) or 120.0)))
+        prog = max(float(getattr(state, "section_progress", 0.0)), self.tension_env)
+
+        # Exponentially accelerating riser pulse: 1/4 -> 1/8 -> 1/16 -> 1/32 note pulses
+        base_hz = bpm / 60.0
+        riser_freq = base_hz * (2.0 ** min(4.0, prog * 3.8))
+        strobe_val = math.sin(self._build_time * riser_freq * 2.0 * math.pi)
+
+        # Duty cycle sharpens as build accelerates
+        pulse_gate = 1.0 if strobe_val > (-0.2 + prog * 0.4) else max(0.12, 1.0 - prog * 0.88)
+        sat_drain = max(0.20, 1.0 - prog * 0.70)
+
         out = []
         for i, (h, s, v) in enumerate(frame):
             dist_norm = abs(i - half) / half
             narrow_factor = max(0.15, 1.0 - dist_norm * (self.tension_env * 0.75))
-            new_v = int(v * narrow_factor)
-            out.append((h, s, new_v))
+            new_v = int(v * narrow_factor * pulse_gate)
+            new_s = max(16, int(s * sat_drain))
+            out.append((h, new_s, new_v))
         return out
 
 
@@ -1689,6 +1707,7 @@ class EdmModeStyle(VisualStyle):
         if not pal:
             pal = DEFAULT_PALETTE
         half = (num_zones - 1) / 2.0 if num_zones > 1 else 0.5
+        sp = max(0.2, self.speed)
         now = time.time()
         bands = np.asarray(getattr(state, "bands", []), dtype=np.float32).reshape(-1)
         if bands.size:
@@ -1828,14 +1847,18 @@ class EdmModeStyle(VisualStyle):
                 # Progressive build tension illuminates mid-wings and builds toward center
                 value = colored_base
             elif dist_centre < 6.0 and kick_val > 0.2:
-                # Center ICs (20-29): Bass kick detonation core
-                value = (kick_val * 80.0) * (1.0 - dist_centre / 6.0) * self.intensity
-            elif (dist_centre > (half - 5.0)) and high_band > 0.22:
-                # Outer edge ICs (0-9 & 40-49): Percussive air & hi-hat snaps
-                value = high_band * 60.0 * self.intensity
-            elif abs(dist_centre - 12.0) < 5.0 and mid_band > 0.25:
-                # Mid-wings (10-19 & 30-39): Synth lead & melodic body
-                value = mid_band * 50.0 * self.intensity
+                # Center ICs (20-29): Bass kick detonation core with trap 808 sub-bass slide
+                value = (kick_val * 85.0) * (1.0 - dist_centre / 6.0) * self.intensity
+            elif (dist_centre > (half - 6.0)) and high_band > 0.18:
+                # Outer edge ICs (0-9 & 40-49): Percussive air & machine-gun trap hi-hat rolls
+                # Rapid 32nd-note stutter flutter for trap/metal hi-hats
+                roll_tick = math.sin(now * 36.0 * sp + i * 2.1) > 0.15
+                value = high_band * (85.0 if roll_tick else 45.0) * self.intensity
+                if high_band > 0.40 and roll_tick:
+                    sat = max(15, int(sat * 0.25))  # Diamond white sparkles on trap hi-hat rolls
+            elif abs(dist_centre - 12.0) < 5.0 and mid_band > 0.22:
+                # Mid-wings (10-19 & 30-39): Synth lead, brass stabs & prog rock guitar riffs
+                value = mid_band * 65.0 * self.intensity
             else:
                 # Inactive ICs stay strictly True Black ([0, 0, 0])
                 value = 0.0
