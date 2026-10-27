@@ -2124,24 +2124,58 @@ class TwinkleStyle(VisualStyle):
                 b = int(np.clip(energy * 35.0 * self.intensity, 0, 100))
             return [(h, s, b)]
 
-        # Spawn real event-driven sparkles on high-frequency transients / hat hits
-        is_treble_transient = (hat_val > 0.28 and (hat_val - self._prev_hat) > 0.08) or (onset_val > 0.50 and hat_val > 0.35)
+        # Crazy fast, loud or insane state detection for L930 (hard drops, rapid tempo, peak loudness)
+        bpm = float(getattr(state, "bpm", 120.0) or 120.0)
+        kick_val = float(getattr(state, "kick", 0.0))
+        is_insane = bool(
+            num_zones > 1
+            and (
+                (energy > 0.72)
+                or (energy > 0.55 and (kick_val > 0.75 or hat_val > 0.70))
+                or (bpm > 155.0 and energy > 0.50)
+                or (getattr(state, "section", "") == Section.DROP and energy > 0.45)
+                or getattr(state, "is_extreme_bass", False)
+            )
+        )
+
+        # Spawn real event-driven sparkles on high-frequency transients / hat hits or insane bursts
+        is_treble_transient = (
+            (hat_val > 0.28 and (hat_val - self._prev_hat) > 0.08)
+            or (onset_val > 0.50 and hat_val > 0.35)
+            or (is_insane and (kick_val > 0.60 or onset_val > 0.40))
+        )
         self._prev_hat = hat_val
 
-        if is_treble_transient and (now - self._last_spawn_time) > 0.04:
+        if is_treble_transient and (now - self._last_spawn_time) > (0.025 if is_insane else 0.04):
             self._last_spawn_time = now
-            # Sparkle density scales with treble transient energy
-            count = max(1, min(7, int(1 + hat_val * 6.0)))
-            for _ in range(count):
-                idx = random.randint(0, num_zones - 1)
-                duration = random.uniform(0.12, 0.35) / max(0.5, self.speed)
-                spk_hue = (int(getattr(state, "key_hue", 180)) + random.choice([0, 45, 90, 180])) % 360
-                self._active_sparkles.append({
-                    "pos": idx,
-                    "life": 1.0,
-                    "duration": duration,
-                    "color": (spk_hue, random.randint(5, 30), 100),
-                })
+            if is_insane:
+                # Crazy fast / loud / insane: dazzling multi-colored electric neon sparkles
+                count = max(3, min(12, int(2 + hat_val * 7.0 + energy * 6.0)))
+                insane_hues = [185, 275, 315, 45, 135, 10, 220, 340]
+                for _ in range(count):
+                    idx = random.randint(0, num_zones - 1)
+                    duration = random.uniform(0.08, 0.22) / max(0.5, self.speed)
+                    spk_hue = random.choice(insane_hues)
+                    spk_sat = random.randint(85, 100)
+                    self._active_sparkles.append({
+                        "pos": idx,
+                        "life": 1.0,
+                        "duration": duration,
+                        "color": (spk_hue, spk_sat, 100),
+                    })
+            else:
+                # Normal playback: clean, elegant diamond-white / subtle key sparkles
+                count = max(1, min(7, int(1 + hat_val * 6.0)))
+                for _ in range(count):
+                    idx = random.randint(0, num_zones - 1)
+                    duration = random.uniform(0.12, 0.35) / max(0.5, self.speed)
+                    spk_hue = (int(getattr(state, "key_hue", 180)) + random.choice([0, 45, 90, 180])) % 360
+                    self._active_sparkles.append({
+                        "pos": idx,
+                        "life": 1.0,
+                        "duration": duration,
+                        "color": (spk_hue, random.randint(5, 30), 100),
+                    })
 
         # Update active sparkles independently
         alive_sparkles = []

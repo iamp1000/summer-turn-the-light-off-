@@ -771,3 +771,28 @@ def test_all_l900_styles_distinct_and_calibrated():
     f_tw_sparkle = twinkle.render(MusicState(energy=0.2, hat=0.9, onset=0.8), dt=0.03, num_zones=1)
     assert f_tw_sparkle[0][2] > f_tw_quiet[0][2], "Twinkle must sparkle on hi-hat transient"
 
+
+def test_twinkle_insane_mode_multicolor_sparkles():
+    """
+    Verifies that for L930:
+      1. Under normal music, Twinkle sparkles use subtle/white saturation (s <= 30).
+      2. When music goes crazy fast/loud/insane (energy > 0.75, heavy kick/drop),
+         sparkles explode into vivid saturated multi-colored neon hues (s >= 80).
+    """
+    from src.visual_styles import TwinkleStyle
+    twinkle = TwinkleStyle()
+    # Normal calm track
+    st_normal = MusicState(energy=0.35, hat=0.85, onset=0.75, bpm=120.0, key_hue=180.0)
+    twinkle.render(st_normal, dt=0.03, num_zones=50)
+    for spk in twinkle._active_sparkles:
+        assert spk["color"][1] <= 30, f"Normal twinkle sparkle should be subtle white/silver, got sat={spk['color'][1]}"
+
+    # Reset and simulate crazy insane / loud / fast drop
+    twinkle._active_sparkles.clear()
+    twinkle._last_spawn_time = 0.0
+    st_insane = MusicState(energy=0.88, kick=0.95, hat=0.80, onset=0.90, bpm=175.0, section=Section.DROP)
+    twinkle.render(st_insane, dt=0.03, num_zones=50)
+    assert len(twinkle._active_sparkles) >= 3, "Insane mode must spawn abundant sparkles"
+    insane_sats = [spk["color"][1] for spk in twinkle._active_sparkles]
+    assert all(s >= 80 for s in insane_sats), f"Insane mode sparkles must be saturated multi-colors, got sats={insane_sats}"
+
