@@ -202,8 +202,13 @@ class ScreenCaptureState:
         floor = self._clamp(self.config["dark_scene_min_scale"])
         low = float(self.config["blackout_enter_luminance"])
         high = max(low + 1e-6, float(self.config["dark_luminance"]))
-        progress = self._clamp((self._last_luminance - low) / (high - low))
-        return floor + (1.0 - floor) * progress
+        luminance_progress = self._clamp((self._last_luminance - low) / (high - low))
+        luminance_scale = floor + (1.0 - floor) * luminance_progress
+
+        # Predominantly black frames need to dim the remaining lit content even when
+        # a small bright region raises the overall mean luminance.
+        black_coverage_scale = 1.0 - (1.0 - floor) * self._last_near_black_ratio
+        return min(luminance_scale, black_coverage_scale)
 
 user32 = ctypes.windll.user32
 
@@ -508,9 +513,12 @@ class ScreenSync:
             log.warning("[ScreenSync] Capture worker did not stop within 2 seconds; retaining camera until it exits")
             return
 
+        self._thread = None
+        self._release_camera()
+
+    def _release_camera(self):
         camera = self._camera
         self._camera = None
-        self._thread = None
         if camera:
             for method_name in ("stop", "release"):
                 method = getattr(camera, method_name, None)
@@ -598,17 +606,8 @@ class ScreenSync:
                         frame = self._camera.grab(new_frame_only=False)
                     except Exception as capture_error:
                         log.warning(f"[ScreenSync] DXGI capture failed; switching to MSS: {capture_error}")
-                        camera = self._camera
-                        self._camera = None
                         dxgi_ready = False
-                        if camera:
-                            for method_name in ("stop", "release"):
-                                method = getattr(camera, method_name, None)
-                                if callable(method):
-                                    try:
-                                        method()
-                                    except Exception:
-                                        pass
+                        self._release_camera()
                         self._capture_missing()
                         self._apply_capture_fade(is_l930)
                         time.sleep(0.1)
@@ -644,6 +643,9 @@ class ScreenSync:
                 self._apply_capture_fade(is_l930)
                 log.debug(f"[ScreenSync] Frame notice: {e}")
                 time.sleep(0.2)
+
+        # Also release resources when stop() timed out while a capture call was blocked.
+        self._release_camera()
 
     @staticmethod
     def _blend_hsv(previous: Tuple[int, int, int], target: Tuple[int, int, int], alpha: float) -> Tuple[int, int, int]:
