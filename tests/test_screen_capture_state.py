@@ -84,6 +84,13 @@ def test_dark_scene_scale_dims_without_switching_to_blackout():
     assert 0.18 < scale < 1.0
 
 
+def test_black_pixel_coverage_dims_remaining_lit_regions():
+    state = ScreenCaptureState()
+    state.valid_frame(1.0, 0.40, 0.60)
+    assert state.scene == "DARK"
+    assert state.scene_scale() < 0.60
+
+
 def test_screen_luminance_uses_raw_pixels_not_perceptual_hsv_lift():
     import numpy as np
     from src.screen_sync import measure_screen_luminance
