@@ -186,9 +186,12 @@ def test_music_cannot_relight_blackout(is_l930):
         assert frame["b"] == 0
 
 
-def test_screen_sync_capture_fade_dispatches_unscaled_source_scene():
+def test_screen_sync_capture_fade_dispatches_unscaled_source_scene(monkeypatch):
     """Repeated fade renders scale the final composition rather than compounding the source."""
     from src.screen_sync import ScreenSync, ScreenCaptureState
+
+    now = [10.0]
+    monkeypatch.setattr("src.screen_sync.time.monotonic", lambda: now[0])
 
     class FakeController:
         def __init__(self):
@@ -204,7 +207,7 @@ def test_screen_sync_capture_fade_dispatches_unscaled_source_scene():
         capture_hold_s=0.0,
         capture_fade_s=1.0,
     )
-    ss._capture_state.valid_frame(0.0, 0.3, 0.0)
+    ss._capture_state.valid_frame(now[0], 0.3, 0.0)
     ss._last_valid_scene = (
         None,
         (180, 80, 60),
@@ -212,12 +215,12 @@ def test_screen_sync_capture_fade_dispatches_unscaled_source_scene():
         SCREEN_PROFILES["video"],
     )
 
-    ss._capture_state.capture_missing(0.1)
-    ss._capture_state.capture_missing(0.6)
+    now[0] = 10.1
+    ss._capture_state.capture_missing(now[0])
     ss._apply_capture_fade(is_l930=False)
     first = controller.frames[-1]["b"]
 
-    ss._capture_state.capture_missing(0.8)
+    now[0] = 10.6
     ss._apply_capture_fade(is_l930=False)
     second = controller.frames[-1]["b"]
 
