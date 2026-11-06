@@ -36,6 +36,88 @@ from src.frame_bus import FramePacket, OutputProducer
 from src.logger import log
 from src.music_dynamics import effective_send_rate
 
+SCREEN_STATE_DEFAULTS = {
+    "blackout_enter_luminance": 0.012,
+    "blackout_wake_luminance": 0.025,
+    "dark_luminance": 0.10,
+    "blackout_confirm_s": 0.35,
+    "capture_stale_s": 0.20,
+    "capture_hold_s": 0.50,
+    "capture_fade_s": 0.50,
+    "recovery_attack_s": 0.20,
+}
+
+
+class ScreenCaptureState:
+    """Pure capture-validity and screen-scene state with separate blackout logic."""
+
+    def __init__(self, **config):
+        self.config = {**SCREEN_STATE_DEFAULTS, **config}
+        self.scene = "STARTING"
+        self.capture_status = "CAPTURE_UNAVAILABLE"
+        self.last_valid_at = None
+        self._black_since = None
+        self._blackout = False
+        self._recover_at = None
+        self._output_at_loss = 1.0
+        self._last_luminance = None
+        self._has_valid_frame = False
+
+    def valid_frame(self, now: float, luminance: float):
+        now = float(now)
+        luminance = max(0.0, min(1.0, float(luminance)))
+        was_unavailable = self.capture_status != "AVAILABLE" or self.last_valid_at is None or now - self.last_valid_at >= self.config["capture_stale_s"]
+        self.capture_status = "AVAILABLE"
+        self.last_valid_at = now
+        self._has_valid_frame = True
+        self._last_luminance = luminance
+        if was_unavailable:
+            self._output_at_loss = self.output_scale(now)
+            self._recover_at = now
+        if self._blackout:
+            if luminance >= self.config["blackout_wake_luminance"]:
+                self._blackout = False
+                self._black_since = None
+                self._recover_at = now
+        elif luminance <= self.config["blackout_enter_luminance"]:
+            if self._black_since is None:
+                self._black_since = now
+            if now - self._black_since >= self.config["blackout_confirm_s"]:
+                self._blackout = True
+                self._recover_at = None
+        else:
+            self._black_since = None
+        if self._blackout:
+            self.scene = "BLACKOUT"
+        elif luminance <= self.config["blackout_enter_luminance"]:
+            self.scene = "DARK"
+        elif luminance <= self.config["dark_luminance"]:
+            self.scene = "DARK"
+        else:
+            self.scene = "ACTIVE"
+
+    def capture_missing(self, now: float):
+        if self.last_valid_at is None or float(now) - self.last_valid_at >= self.config["capture_stale_s"]:
+            self.capture_status = "CAPTURE_UNAVAILABLE"
+
+    def output_scale(self, now: float) -> float:
+        now = float(now)
+        if self.last_valid_at is None:
+            return 0.0
+        if self.capture_status != "AVAILABLE" or now - self.last_valid_at >= self.config["capture_stale_s"]:
+            elapsed = now - self.last_valid_at
+            hold = self.config["capture_hold_s"]
+            fade = max(1e-6, self.config["capture_fade_s"])
+            return self._output_at_loss * max(0.0, min(1.0, 1.0 - (elapsed - hold) / fade))
+        if self._blackout:
+            return 0.0
+        if self._recover_at is not None:
+            scale = max(0.0, min(1.0, (now - self._recover_at) / max(1e-6, self.config["recovery_attack_s"])))
+            if scale >= 1.0:
+                self._recover_at = None
+            return scale
+        return 1.0
+
 user32 = ctypes.windll.user32
 
 
@@ -220,6 +302,9 @@ class ScreenSync:
         self._monitor_index = 0
         self._profile_name = "video"
         self._camera = None
+        self._capture_state = ScreenCaptureState(**self._load_capture_config())
+        self._last_capture_frame_at = None
+        self._last_valid_scene = None
 
         self._zone_smoother = ZoneAsymmetricSmoother(num_zones=50, attack_rate=0.70, decay_rate=0.22)
         self._l900_smoother = AsymmetricSmoother(attack_rate=0.70, decay_rate=0.22)
@@ -234,6 +319,17 @@ class ScreenSync:
         self.latest_screen_data: ScreenData = ScreenData()
 
         self._load_config()
+
+    def _load_capture_config(self):
+        try:
+            config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                return {**SCREEN_STATE_DEFAULTS, **(cfg.get("screen_sync", {}).get("state", {}) or {})}
+        except Exception as exc:
+            log.warning(f"[ScreenSync] Capture-state config unavailable: {exc}")
+        return dict(SCREEN_STATE_DEFAULTS)
 
     def _load_config(self):
         try:
@@ -288,6 +384,21 @@ class ScreenSync:
                 self._camera = None
             except Exception:
                 pass
+
+    def _process_capture_frame(self, frame: np.ndarray, is_l930: bool, profile: dict):
+        if frame.ndim != 3 or frame.shape[0] < 1 or frame.shape[1] < 1 or frame.shape[2] < 3:
+            self._capture_missing()
+            return
+        segs, global_hsv = self._extract_colors(frame, is_l930, profile)
+        luminance = float(global_hsv[2]) / 100.0
+        now = time.monotonic()
+        self._capture_state.valid_frame(now, luminance)
+        self._last_capture_frame_at = now
+        self._last_valid_scene = (segs, global_hsv, is_l930, profile)
+        self._dispatch(segs, global_hsv, is_l930, profile)
+
+    def _capture_missing(self):
+        self._capture_state.capture_missing(time.monotonic())
 
     def _init_camera(self):
         if dxcam is not None:
@@ -345,8 +456,10 @@ class ScreenSync:
                 if dxgi_ready and self._camera:
                     frame = self._camera.grab()
                     if frame is not None:
-                        segs, global_hsv = self._extract_colors(frame, is_l930, profile)
-                        self._dispatch(segs, global_hsv, is_l930, profile)
+                        self._process_capture_frame(frame, is_l930, profile)
+                    else:
+                        self._capture_missing()
+                        self._apply_capture_fade(is_l930)
                     time.sleep(0.025)
                     continue
 
@@ -358,13 +471,18 @@ class ScreenSync:
                         while self._running:
                             img_grab = sct.grab(monitor)
                             frame = np.array(img_grab)[:, :, :3]  # BGRA -> BGR
-                            segs, global_hsv = self._extract_colors(frame, is_l930, profile)
-                            self._dispatch(segs, global_hsv, is_l930, profile)
+                            if frame.size:
+                                self._process_capture_frame(frame, is_l930, profile)
+                            else:
+                                self._capture_missing()
+                                self._apply_capture_fade(is_l930)
                             time.sleep(0.030)
                 else:
                     time.sleep(0.5)
 
             except Exception as e:
+                self._capture_missing()
+                self._apply_capture_fade(is_l930)
                 log.debug(f"[ScreenSync] Frame notice: {e}")
                 time.sleep(0.2)
 
@@ -380,7 +498,20 @@ class ScreenSync:
         val = int(round(int(pv) + alpha * (int(tv) - int(pv))))
         return hue, max(0, min(100, sat)), max(0, min(100, val))
 
-    def _dispatch(self, segs, global_hsv, is_l930: bool, profile: dict):
+    def _apply_capture_fade(self, is_l930: bool):
+        if self._last_valid_scene is None:
+            return
+        now = time.monotonic()
+        self._capture_state.capture_missing(now)
+        scale = self._capture_state.output_scale(now)
+        segs, global_hsv, _, profile = self._last_valid_scene
+        faded_global = (global_hsv[0], global_hsv[1], int(round(global_hsv[2] * scale)))
+        faded_segs = None if segs is None else [
+            [zone[0], zone[1], int(round(zone[2] * scale))] for zone in segs
+        ]
+        self._dispatch(faded_segs, faded_global, is_l930, profile, apply_scene_state=False)
+
+    def _dispatch(self, segs, global_hsv, is_l930: bool, profile: dict, apply_scene_state: bool = True):
         """Smooth dominant and per-zone screen colors, including abrupt scene cuts and audio vocal reactivity."""
         cut_thresh = float(profile["cut_threshold"])
         master_ceiling = self._app_state.get("brightness", 100) / 100.0
@@ -391,6 +522,12 @@ class ScreenSync:
         else:
             dt = max(0.001, min(0.20, now_mono - self._last_dispatch_monotonic))
         self._last_dispatch_monotonic = now_mono
+
+        if apply_scene_state:
+            scale = self._capture_state.output_scale(now_mono)
+            global_hsv = (global_hsv[0], global_hsv[1], int(round(global_hsv[2] * scale)))
+            if segs is not None:
+                segs = [[zone[0], zone[1], int(round(zone[2] * scale))] for zone in segs]
 
         target_global = tuple(int(v) for v in global_hsv)
         target_columns = (
