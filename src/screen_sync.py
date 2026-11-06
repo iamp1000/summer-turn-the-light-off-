@@ -39,7 +39,10 @@ from src.music_dynamics import effective_send_rate
 SCREEN_STATE_DEFAULTS = {
     "blackout_enter_luminance": 0.012,
     "blackout_wake_luminance": 0.025,
+    "blackout_pixel_luminance": 0.015,
+    "blackout_min_near_black_ratio": 0.995,
     "dark_luminance": 0.10,
+    "dark_scene_min_scale": 0.18,
     "blackout_confirm_s": 0.35,
     "capture_stale_s": 0.20,
     "capture_hold_s": 0.50,
@@ -49,74 +52,158 @@ SCREEN_STATE_DEFAULTS = {
 
 
 class ScreenCaptureState:
-    """Pure capture-validity and screen-scene state with separate blackout logic."""
+    """Tracks valid capture separately from the luminance of valid screen content."""
 
     def __init__(self, **config):
         self.config = {**SCREEN_STATE_DEFAULTS, **config}
         self.scene = "STARTING"
         self.capture_status = "CAPTURE_UNAVAILABLE"
-        self.last_valid_at = None
-        self._black_since = None
+        self.last_valid_at: Optional[float] = None
+        self.capture_unavailable_since: Optional[float] = None
+        self._black_since: Optional[float] = None
         self._blackout = False
-        self._recover_at = None
-        self._output_at_loss = 1.0
-        self._last_luminance = None
-        self._has_valid_frame = False
+        self._recover_at: Optional[float] = None
+        self._recover_from_scale = 0.0
+        self._output_at_loss = 0.0
+        self._last_luminance: Optional[float] = None
+        self._last_near_black_ratio = 0.0
 
-    def valid_frame(self, now: float, luminance: float):
-        now = float(now)
-        luminance = max(0.0, min(1.0, float(luminance)))
-        was_unavailable = self.capture_status != "AVAILABLE" or self.last_valid_at is None or now - self.last_valid_at >= self.config["capture_stale_s"]
-        self.capture_status = "AVAILABLE"
-        self.last_valid_at = now
-        self._has_valid_frame = True
-        self._last_luminance = luminance
-        if was_unavailable:
-            self._output_at_loss = self.output_scale(now)
-            self._recover_at = now
+    @staticmethod
+    def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+        return max(low, min(high, float(value)))
+
+    def _available_scale(self, now: float) -> float:
         if self._blackout:
-            if luminance >= self.config["blackout_wake_luminance"]:
+            return 0.0
+        if self._recover_at is None:
+            return 1.0
+        duration = max(1e-6, float(self.config["recovery_attack_s"]))
+        progress = self._clamp((float(now) - self._recover_at) / duration)
+        if progress >= 1.0:
+            self._recover_at = None
+            self._recover_from_scale = 1.0
+            return 1.0
+        return self._recover_from_scale + (1.0 - self._recover_from_scale) * progress
+
+    def _mark_unavailable_if_stale(self, now: float) -> None:
+        if self.last_valid_at is None or self.capture_status != "AVAILABLE":
+            return
+        stale_after = max(0.0, float(self.config["capture_stale_s"]))
+        unavailable_at = self.last_valid_at + stale_after
+        if float(now) < unavailable_at:
+            return
+
+        # Preserve the current fade/recovery level at the instant the source becomes stale.
+        self._output_at_loss = self._available_scale(now)
+        self.capture_unavailable_since = unavailable_at
+        self.capture_status = "CAPTURE_UNAVAILABLE"
+        self._recover_at = None
+
+    def valid_frame(
+        self,
+        now: float,
+        luminance: float,
+        near_black_ratio: Optional[float] = None,
+    ) -> None:
+        now = float(now)
+        luminance = self._clamp(luminance)
+        if near_black_ratio is None:
+            near_black_ratio = (
+                1.0 if luminance <= float(self.config["blackout_pixel_luminance"]) else 0.0
+            )
+        near_black_ratio = self._clamp(near_black_ratio)
+
+        # Work out the output level before resetting the capture timestamp/status.
+        self._mark_unavailable_if_stale(now)
+        was_unavailable = (
+            self.capture_status != "AVAILABLE" or self.last_valid_at is None
+        )
+        previous_scale = self.output_scale(now) if self.last_valid_at is not None else 0.0
+
+        self.capture_status = "AVAILABLE"
+        self.capture_unavailable_since = None
+        self.last_valid_at = now
+        self._last_luminance = luminance
+        self._last_near_black_ratio = near_black_ratio
+
+        near_black_limit = self._clamp(
+            self.config["blackout_min_near_black_ratio"], 0.0, 1.0
+        )
+        black_evidence = (
+            luminance <= float(self.config["blackout_enter_luminance"])
+            and near_black_ratio >= near_black_limit
+        )
+        wake_evidence = (
+            luminance >= float(self.config["blackout_wake_luminance"])
+            and near_black_ratio < near_black_limit
+        )
+
+        if self._blackout:
+            if wake_evidence:
                 self._blackout = False
                 self._black_since = None
+                self._recover_from_scale = 0.0
                 self._recover_at = now
-        elif luminance <= self.config["blackout_enter_luminance"]:
+        elif black_evidence:
             if self._black_since is None:
                 self._black_since = now
-            if now - self._black_since >= self.config["blackout_confirm_s"]:
+            confirm_s = max(0.0, float(self.config["blackout_confirm_s"]))
+            if now - self._black_since >= confirm_s:
                 self._blackout = True
                 self._recover_at = None
         else:
             self._black_since = None
+
         if self._blackout:
             self.scene = "BLACKOUT"
-        elif luminance <= self.config["blackout_enter_luminance"]:
-            self.scene = "DARK"
-        elif luminance <= self.config["dark_luminance"]:
+            self._recover_at = None
+        elif (
+            luminance <= float(self.config["dark_luminance"])
+            or near_black_ratio >= 0.50
+        ):
             self.scene = "DARK"
         else:
             self.scene = "ACTIVE"
 
-    def capture_missing(self, now: float):
-        if self.last_valid_at is None or float(now) - self.last_valid_at >= self.config["capture_stale_s"]:
-            self.capture_status = "CAPTURE_UNAVAILABLE"
+        # Recover from the level at which capture failed; first startup begins from OFF.
+        if was_unavailable and not self._blackout:
+            self._recover_from_scale = previous_scale
+            self._recover_at = now
+
+    def capture_missing(self, now: float) -> None:
+        self._mark_unavailable_if_stale(float(now))
 
     def output_scale(self, now: float) -> float:
         now = float(now)
-        if self.last_valid_at is None:
-            return 0.0
-        if self.capture_status != "AVAILABLE" or now - self.last_valid_at >= self.config["capture_stale_s"]:
-            elapsed = now - self.last_valid_at
-            hold = self.config["capture_hold_s"]
-            fade = max(1e-6, self.config["capture_fade_s"])
-            return self._output_at_loss * max(0.0, min(1.0, 1.0 - (elapsed - hold) / fade))
         if self._blackout:
             return 0.0
-        if self._recover_at is not None:
-            scale = max(0.0, min(1.0, (now - self._recover_at) / max(1e-6, self.config["recovery_attack_s"])))
-            if scale >= 1.0:
-                self._recover_at = None
-            return scale
-        return 1.0
+        if self.last_valid_at is None:
+            return 0.0
+
+        self._mark_unavailable_if_stale(now)
+        if self.capture_status != "AVAILABLE":
+            if self.capture_unavailable_since is None:
+                return 0.0
+            elapsed = max(0.0, now - self.capture_unavailable_since)
+            hold = max(0.0, float(self.config["capture_hold_s"]))
+            fade = max(1e-6, float(self.config["capture_fade_s"]))
+            progress = self._clamp((elapsed - hold) / fade)
+            return self._output_at_loss * (1.0 - progress)
+
+        return self._available_scale(now)
+
+    def scene_scale(self) -> float:
+        """Dim valid dark scenes without treating them as capture loss or blackout."""
+        if self._blackout:
+            return 0.0
+        if self.scene != "DARK" or self._last_luminance is None:
+            return 1.0
+
+        floor = self._clamp(self.config["dark_scene_min_scale"])
+        low = float(self.config["blackout_enter_luminance"])
+        high = max(low + 1e-6, float(self.config["dark_luminance"]))
+        progress = self._clamp((self._last_luminance - low) / (high - low))
+        return floor + (1.0 - floor) * progress
 
 user32 = ctypes.windll.user32
 
@@ -172,6 +259,40 @@ def detect_letterbox_bounds(img: np.ndarray, black_thresh: int = 14) -> Tuple[in
         return (0, 0, w, h)
 
     return (left, top, right, bottom)
+
+
+def get_screen_content_region(img: np.ndarray, profile: dict) -> np.ndarray:
+    """Apply the same optional letterbox crop to scene analysis and color extraction."""
+    if profile.get("letterbox_detection"):
+        left, top, right, bottom = detect_letterbox_bounds(img)
+        return img[top:bottom, left:right]
+    return img
+
+
+def measure_screen_luminance(
+    bgr_image: np.ndarray,
+    stride: int = 16,
+    near_black_threshold: float = 0.015,
+) -> Tuple[float, float]:
+    """Return mean Rec.709 luma and the fraction of near-black sampled pixels.
+
+    This intentionally uses the captured pixel values, not the perceptually lifted
+    HSV brightness used for LED rendering.
+    """
+    if (
+        bgr_image.ndim != 3
+        or bgr_image.shape[0] < 1
+        or bgr_image.shape[1] < 1
+        or bgr_image.shape[2] < 3
+    ):
+        return 0.0, 1.0
+
+    sample = bgr_image[::max(1, int(stride)), ::max(1, int(stride)), :3].astype(np.float32) / 255.0
+    b = sample[:, :, 0]
+    g = sample[:, :, 1]
+    r = sample[:, :, 2]
+    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return float(np.mean(luma)), float(np.mean(luma <= max(0.0, float(near_black_threshold))))
 
 
 def extract_dominant_color_weighted(bgr_pixels: np.ndarray, sat_boost: float = 1.30) -> Tuple[int, int, int]:
@@ -378,21 +499,42 @@ class ScreenSync:
             self._audio_coordinator.unregister_subscriber(self)
         if hasattr(self._controller, "clear_frames"):
             self._controller.clear_frames()
-        if self._camera:
-            try:
-                del self._camera
-                self._camera = None
-            except Exception:
-                pass
+
+        worker = self._thread
+        if worker and worker.ident is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=2.0)
+
+        if worker and worker.is_alive():
+            log.warning("[ScreenSync] Capture worker did not stop within 2 seconds; retaining camera until it exits")
+            return
+
+        camera = self._camera
+        self._camera = None
+        self._thread = None
+        if camera:
+            for method_name in ("stop", "release"):
+                method = getattr(camera, method_name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:
+                        pass
 
     def _process_capture_frame(self, frame: np.ndarray, is_l930: bool, profile: dict):
         if frame.ndim != 3 or frame.shape[0] < 1 or frame.shape[1] < 1 or frame.shape[2] < 3:
             self._capture_missing()
+            self._apply_capture_fade(is_l930)
             return
+
+        content_img = get_screen_content_region(frame, profile)
+        luminance, near_black_ratio = measure_screen_luminance(
+            content_img,
+            stride=max(1, int(profile.get("stride", 16))),
+            near_black_threshold=float(self._capture_state.config["blackout_pixel_luminance"]),
+        )
         segs, global_hsv = self._extract_colors(frame, is_l930, profile)
-        luminance = float(global_hsv[2]) / 100.0
         now = time.monotonic()
-        self._capture_state.valid_frame(now, luminance)
+        self._capture_state.valid_frame(now, luminance, near_black_ratio)
         self._last_capture_frame_at = now
         self._last_valid_scene = (segs, global_hsv, is_l930, profile)
         self._dispatch(segs, global_hsv, is_l930, profile)
@@ -416,12 +558,8 @@ class ScreenSync:
         sat_boost = profile["sat_boost"]
         stride = profile["stride"]
 
-        # Letterbox / black-bar crop
-        if profile["letterbox_detection"]:
-            left, top, right, bottom = detect_letterbox_bounds(img)
-            content_img = img[top:bottom, left:right]
-        else:
-            content_img = img
+        # Use the same content crop as the raw-luminance scene classifier.
+        content_img = get_screen_content_region(img, profile)
 
         ch, cw = content_img.shape[:2]
 
@@ -454,7 +592,28 @@ class ScreenSync:
             try:
                 # ── DXGI Capture Path (Primary) ───────────────────────────────
                 if dxgi_ready and self._camera:
-                    frame = self._camera.grab()
+                    try:
+                        # Reuse the latest duplicated desktop image when the screen is static.
+                        # A lack of a newly changed DXGI frame is not capture failure.
+                        frame = self._camera.grab(new_frame_only=False)
+                    except Exception as capture_error:
+                        log.warning(f"[ScreenSync] DXGI capture failed; switching to MSS: {capture_error}")
+                        camera = self._camera
+                        self._camera = None
+                        dxgi_ready = False
+                        if camera:
+                            for method_name in ("stop", "release"):
+                                method = getattr(camera, method_name, None)
+                                if callable(method):
+                                    try:
+                                        method()
+                                    except Exception:
+                                        pass
+                        self._capture_missing()
+                        self._apply_capture_fade(is_l930)
+                        time.sleep(0.1)
+                        continue
+
                     if frame is not None:
                         self._process_capture_frame(frame, is_l930, profile)
                     else:
@@ -501,15 +660,11 @@ class ScreenSync:
     def _apply_capture_fade(self, is_l930: bool):
         if self._last_valid_scene is None:
             return
-        now = time.monotonic()
-        self._capture_state.capture_missing(now)
-        scale = self._capture_state.output_scale(now)
+        self._capture_state.capture_missing(time.monotonic())
+        # Dispatch the untouched last valid scene. Scene/capture scaling is applied once,
+        # after smoothing and audio contributions, so audio cannot relight a blackout.
         segs, global_hsv, _, profile = self._last_valid_scene
-        faded_global = (global_hsv[0], global_hsv[1], int(round(global_hsv[2] * scale)))
-        faded_segs = None if segs is None else [
-            [zone[0], zone[1], int(round(zone[2] * scale))] for zone in segs
-        ]
-        self._dispatch(faded_segs, faded_global, is_l930, profile, apply_scene_state=False)
+        self._dispatch(segs, global_hsv, is_l930, profile)
 
     def _dispatch(self, segs, global_hsv, is_l930: bool, profile: dict, apply_scene_state: bool = True):
         """Smooth dominant and per-zone screen colors, including abrupt scene cuts and audio vocal reactivity."""
@@ -523,11 +678,10 @@ class ScreenSync:
             dt = max(0.001, min(0.20, now_mono - self._last_dispatch_monotonic))
         self._last_dispatch_monotonic = now_mono
 
-        if apply_scene_state:
-            scale = self._capture_state.output_scale(now_mono)
-            global_hsv = (global_hsv[0], global_hsv[1], int(round(global_hsv[2] * scale)))
-            if segs is not None:
-                segs = [[zone[0], zone[1], int(round(zone[2] * scale))] for zone in segs]
+        render_scale = (
+            self._capture_state.output_scale(now_mono) * self._capture_state.scene_scale()
+            if apply_scene_state else 1.0
+        )
 
         target_global = tuple(int(v) for v in global_hsv)
         target_columns = (
@@ -671,8 +825,17 @@ class ScreenSync:
                 for idx in range(min(50, len(smoothed_segs))):
                     smoothed_segs[idx][2] = max(0, min(100, int(round(smoothed_segs[idx][2] * master_ceiling))))
 
+            # Apply capture/scene scaling after all music contributions. A blackout or
+            # unavailable capture must remain OFF regardless of the current audio state.
+            for idx in range(min(50, len(smoothed_segs))):
+                smoothed_segs[idx][2] = max(
+                    0, min(100, int(round(smoothed_segs[idx][2] * render_scale)))
+                )
+
             self._rendered_segs = smoothed_segs
-            scaled_b = max(1, int(100 * master_ceiling))
+            scaled_b = max(0, min(100, int(round(100 * master_ceiling))))
+            if render_scale <= 1e-6:
+                scaled_b = 0
 
             configured_rate = getattr(self._controller, "_max_updates_per_s", 8.0)
             effective_rate = effective_send_rate(self._controller, fallback_rate=configured_rate)
@@ -741,7 +904,10 @@ class ScreenSync:
 
             combined_lift = vocal_boost * 0.85 + theme_boost * 0.90
             base_b = gv * master_ceiling
-            final_b = max(0, min(100, int(round(base_b + combined_lift)))) if gv > 0 else 0
+            final_b = (
+                max(0, min(100, int(round((base_b + combined_lift) * render_scale))))
+                if gv > 0 and render_scale > 1e-6 else 0
+            )
 
             # Rich color saturation bloom when music and vocals swell
             if vocal_boost > 0.5 or theme_boost > 0.5:
