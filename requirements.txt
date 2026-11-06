@@ -1,6 +1,9 @@
 # Tapo device control (supports L530/L900 color strips/bulbs)
 plugp100>=4.0.0
 
+# Desktop GUI
+customtkinter>=5.2.2
+
 # System tray icon
 pystray>=0.19.5
 Pillow>=10.0.0

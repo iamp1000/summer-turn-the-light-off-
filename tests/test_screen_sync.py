@@ -71,7 +71,7 @@ def test_screen_sync_audio_reactivity_l930_and_l900():
 
     ss_l930 = ScreenSync(ctrl_l930, loop_runner=None, app_state={"brightness": 100}, audio_coordinator=coord)
     base_segs = [[180, 80, 30] for _ in range(50)]
-    ss_l930._dispatch(base_segs, (180, 80, 30), is_l930=True, profile=SCREEN_PROFILES["video"])
+    ss_l930._dispatch(base_segs, (180, 80, 30), is_l930=True, profile=SCREEN_PROFILES["video"], apply_scene_state=False)
 
     assert len(submitted_frames) >= 1
     l930_frame = submitted_frames[-1]
@@ -83,7 +83,7 @@ def test_screen_sync_audio_reactivity_l930_and_l900():
     # 2. Test L900 with vocal and theme music building intensity
     ctrl_l900 = FakeController(is_l930=False)
     ss_l900 = ScreenSync(ctrl_l900, loop_runner=None, app_state={"brightness": 100}, audio_coordinator=coord)
-    ss_l900._dispatch(None, (180, 80, 30), is_l930=False, profile=SCREEN_PROFILES["video"])
+    ss_l900._dispatch(None, (180, 80, 30), is_l930=False, profile=SCREEN_PROFILES["video"], apply_scene_state=False)
 
     l900_frame = submitted_frames[-1]
     assert "b" in l900_frame
@@ -116,12 +116,115 @@ def test_screen_sync_pure_kicks_do_not_flash_or_strobe():
     ctrl = FakeController(is_l930=True)
     ss = ScreenSync(ctrl, loop_runner=None, app_state={"brightness": 100}, audio_coordinator=coord)
     base_segs = [[180, 80, 30] for _ in range(50)]
-    ss._dispatch(base_segs, (180, 80, 30), is_l930=True, profile=SCREEN_PROFILES["video"])
+    ss._dispatch(base_segs, (180, 80, 30), is_l930=True, profile=SCREEN_PROFILES["video"], apply_scene_state=False)
 
     frame = submitted_frames[-1]
     # Center zone should remain around base 30; no flash, no white strobe (saturation remains 80)
     assert frame["segments"][24][2] <= 32, f"Kick only should not flare screen sync, got {frame['segments'][24][2]}"
     assert frame["segments"][24][1] == 80, f"Screen sync should never strobe white or desaturate"
+
+
+
+@pytest.mark.parametrize("is_l930", [False, True])
+def test_music_cannot_relight_blackout(is_l930):
+    """Confirmed screen blackout overrides all audio contributions for L900 and L930."""
+    from src.screen_sync import ScreenSync, ScreenCaptureState
+    from src.audio_dsp import MusicState
+
+    submitted_frames = []
+
+    class FakeController:
+        def __init__(self):
+            if is_l930:
+                self.set_segments = lambda segs: True
+
+        def submit_frame(self, frame):
+            submitted_frames.append(frame)
+
+    class FakeCoordinator:
+        def get_latest_state(self):
+            return MusicState(
+                energy=0.95,
+                harmonic_ratio=0.95,
+                speech_dominance=1.0,
+                mid=0.95,
+                bands=[0.95] * 50,
+            ), {}
+
+    ss = ScreenSync(
+        FakeController(),
+        loop_runner=None,
+        app_state={"brightness": 100},
+        audio_coordinator=FakeCoordinator(),
+    )
+    ss._capture_state = ScreenCaptureState(
+        blackout_confirm_s=0.1,
+        capture_stale_s=1.0,
+    )
+    ss._capture_state.valid_frame(0.0, 0.0, 1.0)
+    ss._capture_state.valid_frame(0.2, 0.0, 1.0)
+    assert ss._capture_state.scene == "BLACKOUT"
+
+    if is_l930:
+        ss._dispatch(
+            [[180, 80, 30] for _ in range(50)],
+            (180, 80, 30),
+            is_l930=True,
+            profile=SCREEN_PROFILES["video"],
+        )
+        frame = submitted_frames[-1]
+        assert frame["brightness"] == 0
+        assert all(zone[2] == 0 for zone in frame["segments"])
+    else:
+        ss._dispatch(
+            None,
+            (180, 80, 30),
+            is_l930=False,
+            profile=SCREEN_PROFILES["video"],
+        )
+        frame = submitted_frames[-1]
+        assert frame["b"] == 0
+
+
+def test_screen_sync_capture_fade_dispatches_unscaled_source_scene(monkeypatch):
+    """Repeated fade renders scale the final composition rather than compounding the source."""
+    from src.screen_sync import ScreenSync, ScreenCaptureState
+
+    now = [10.0]
+    monkeypatch.setattr("src.screen_sync.time.monotonic", lambda: now[0])
+
+    class FakeController:
+        def __init__(self):
+            self.frames = []
+
+        def submit_frame(self, frame):
+            self.frames.append(frame)
+
+    controller = FakeController()
+    ss = ScreenSync(controller, loop_runner=None, app_state={"brightness": 100})
+    ss._capture_state = ScreenCaptureState(
+        capture_stale_s=0.1,
+        capture_hold_s=0.0,
+        capture_fade_s=1.0,
+    )
+    ss._capture_state.valid_frame(now[0], 0.3, 0.0)
+    ss._last_valid_scene = (
+        None,
+        (180, 80, 60),
+        False,
+        SCREEN_PROFILES["video"],
+    )
+
+    now[0] = 10.1
+    ss._capture_state.capture_missing(now[0])
+    ss._apply_capture_fade(is_l930=False)
+    first = controller.frames[-1]["b"]
+
+    now[0] = 10.6
+    ss._apply_capture_fade(is_l930=False)
+    second = controller.frames[-1]["b"]
+
+    assert 0 <= second < first
 
 
 def test_drop_bloom_preserves_pure_negative_space():
