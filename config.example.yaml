@@ -49,3 +49,15 @@ screen_sync:
   black_bar_detection: true           # Detect and ignore letterbox/pillarbox bars
   room_floor_brightness: 18           # Minimum brightness floor in Movie mode (%)
   flare_on_impacts: true              # Trigger brightness flares on low-frequency impacts
+  state:
+    blackout_enter_luminance: 0.012
+    blackout_wake_luminance: 0.025
+    blackout_pixel_luminance: 0.015
+    blackout_min_near_black_ratio: 0.995
+    dark_luminance: 0.10
+    dark_scene_min_scale: 0.18
+    blackout_confirm_s: 0.35
+    capture_stale_s: 0.20
+    capture_hold_s: 0.50
+    capture_fade_s: 0.50
+    recovery_attack_s: 0.20
